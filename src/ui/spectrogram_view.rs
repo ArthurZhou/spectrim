@@ -2,6 +2,15 @@ use eframe::egui;
 
 use crate::audio::types::{AudioData, Selection, SelectionAction, Spectrogram};
 
+/// Half-width of the playhead notch triangle. Doubles as its grab radius, so
+/// the visual affordance and the hit area always agree.
+const PLAYHEAD_GRAB_X: f32 = 7.0;
+/// Height of the notch triangle.
+const PLAYHEAD_NOTCH_H: f32 = 11.0;
+/// Extra slack around the notch when hit-testing, so the thin line itself is
+/// still easy to grab.
+const PLAYHEAD_HIT_SLACK: f32 = 3.0;
+
 #[derive(Default)]
 pub struct SpectrogramView {
     time_range: Option<(f32, f32)>,
@@ -182,14 +191,95 @@ impl SpectrogramView {
             }
         }
 
-        let playhead_x = time_to_x(playhead.clamp(0.0, duration)).clamp(plot.left(), plot.right());
-        ui.painter().line_segment(
-            [
-                egui::pos2(playhead_x, plot.top()),
-                egui::pos2(playhead_x, plot.bottom()),
-            ],
-            egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
-        );
+        // --- Playhead -----------------------------------------------------
+        // Always drawn, with grabbable notch handles at both ends.
+        //
+        // `playhead_raw_x` is the true (unclamped) screen position and
+        // `playhead_in_view` says whether it falls inside the visible time
+        // window. The previous code only kept the *clamped* x, which had two
+        // problems: the handle vanished as soon as you zoomed away from it, and
+        // the drag hit-test compared against the clamped edge, so the entire
+        // left/right edge of the plot behaved like the playhead and swallowed
+        // region-creation drags. Keeping both fixes the hit-test and lets us
+        // draw an off-screen indicator instead of losing the handle.
+        let playhead_time = playhead.clamp(0.0, duration);
+        let playhead_raw_x = time_to_x(playhead_time);
+        let playhead_in_view = playhead_raw_x >= plot.left() && playhead_raw_x <= plot.right();
+        let playhead_x = playhead_raw_x.clamp(plot.left(), plot.right());
+        let dragging_playhead = matches!(self.drag, Some(DragMode::Playhead));
+        let notch_fill = if dragging_playhead {
+            egui::Color32::from_rgb(255, 228, 130)
+        } else {
+            egui::Color32::from_rgb(255, 186, 66)
+        };
+        let notch_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_black_alpha(170));
+        let painter = ui.painter();
+
+        if playhead_in_view {
+            // Dark outline under the white line keeps it legible over the bright
+            // yellow/green part of the viridis colormap.
+            painter.line_segment(
+                [
+                    egui::pos2(playhead_x, plot.top()),
+                    egui::pos2(playhead_x, plot.bottom()),
+                ],
+                egui::Stroke::new(4.0_f32, egui::Color32::from_black_alpha(110)),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(playhead_x, plot.top()),
+                    egui::pos2(playhead_x, plot.bottom()),
+                ],
+                egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
+            );
+            // Top notch pointing down into the plot.
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(playhead_x - PLAYHEAD_GRAB_X, plot.top()),
+                    egui::pos2(playhead_x + PLAYHEAD_GRAB_X, plot.top()),
+                    egui::pos2(playhead_x, plot.top() + PLAYHEAD_NOTCH_H),
+                ],
+                notch_fill,
+                notch_stroke,
+            ));
+            // Bottom notch pointing up, so the handle is reachable from either
+            // end of a tall plot.
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(playhead_x - PLAYHEAD_GRAB_X, plot.bottom()),
+                    egui::pos2(playhead_x + PLAYHEAD_GRAB_X, plot.bottom()),
+                    egui::pos2(playhead_x, plot.bottom() - PLAYHEAD_NOTCH_H),
+                ],
+                notch_fill,
+                notch_stroke,
+            ));
+            draw_playhead_label(painter, playhead_time, playhead_x, notch_fill, plot, true);
+        } else {
+            // Off-screen: park an arrow at the near edge pointing toward the
+            // playhead so the position is never invisible.
+            let on_left = playhead_raw_x < plot.left();
+            let edge_x = if on_left { plot.left() } else { plot.right() };
+            // Base sits inward from the edge; the apex touches the edge.
+            let inward = if on_left { 1.0 } else { -1.0 };
+            let mid_y = plot.center().y;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(edge_x, mid_y),
+                    egui::pos2(edge_x + inward * (PLAYHEAD_NOTCH_H + 3.0), mid_y - 8.0),
+                    egui::pos2(edge_x + inward * (PLAYHEAD_NOTCH_H + 3.0), mid_y + 8.0),
+                ],
+                notch_fill,
+                notch_stroke,
+            ));
+            draw_playhead_label(
+                painter,
+                playhead_time,
+                edge_x + inward * (PLAYHEAD_NOTCH_H + 9.0),
+                notch_fill,
+                plot,
+                !on_left,
+            );
+        }
 
         let mut events = ViewEvents {
             created: None,
@@ -206,6 +296,17 @@ impl SpectrogramView {
                 response
                     .clone()
                     .on_hover_text(format!("Time: {:.3} s\nFrequency: {:.1} Hz", time, hz));
+                // Advertise that the playhead can be grabbed, and do so on the
+                // unclamped position so the plot edges stay free for creating
+                // regions.
+                if dragging_playhead
+                    || (playhead_in_view
+                        && (position.x - playhead_raw_x).abs()
+                            <= PLAYHEAD_GRAB_X + PLAYHEAD_HIT_SLACK)
+                {
+                    ui.ctx()
+                        .output_mut(|output| output.cursor_icon = egui::CursorIcon::ResizeColumn);
+                }
             }
         }
 
@@ -245,7 +346,9 @@ impl SpectrogramView {
             }
         } else if response.drag_started_by(egui::PointerButton::Primary) {
             if let Some(position) = pointer {
-                if (position.x - playhead_x).abs() < 8.0 {
+                if playhead_in_view
+                    && (position.x - playhead_raw_x).abs() <= PLAYHEAD_GRAB_X + PLAYHEAD_HIT_SLACK
+                {
                     self.drag = Some(DragMode::Playhead);
                     events.seek_to = Some(point_to_values(position).0);
                 } else if let Some(selected) = selected_id
@@ -421,6 +524,49 @@ impl SpectrogramView {
         let _ = spectrogram;
         events
     }
+}
+
+/// Draw the playhead's time readout next to its notch.
+///
+/// `anchor_x` is the handle position and `anchor_left_of_label` says whether the
+/// label should extend to the right of it (it flips near the plot's right edge so
+/// the readout is never clipped off-screen).
+fn draw_playhead_label(
+    painter: &egui::Painter,
+    time: f32,
+    anchor_x: f32,
+    color: egui::Color32,
+    plot: egui::Rect,
+    anchor_left_of_label: bool,
+) {
+    let text = format!("{time:.2}s");
+    let font = egui::FontId::monospace(10.0);
+    let galley = painter.layout_no_wrap(text.clone(), font, color);
+    let padding = 3.0_f32;
+    let width = galley.size().x + padding * 2.0;
+    let height = galley.size().y + padding;
+    let gap = 4.0_f32;
+
+    let mut left = if anchor_left_of_label {
+        anchor_x + gap
+    } else {
+        anchor_x - gap - width
+    };
+    // Keep the box inside the plot; flip to the other side if it would overflow.
+    if left + width > plot.right() {
+        left = anchor_x - gap - width;
+    }
+    if left < plot.left() {
+        left = anchor_x + gap;
+    }
+    left = left.clamp(plot.left(), (plot.right() - width).max(plot.left()));
+
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(left, plot.top() + 2.0),
+        egui::vec2(width, height),
+    );
+    painter.rect_filled(rect, 3.0, egui::Color32::from_black_alpha(175));
+    painter.galley(rect.center() - galley.size() * 0.5, galley, color);
 }
 
 fn format_time(time: f32) -> String {

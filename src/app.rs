@@ -1,41 +1,98 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
 use crate::audio::decode::decode_file;
 use crate::audio::export::export_wav;
+use crate::audio::preview::{PreviewCache, PreviewOutcome};
 use crate::audio::process::apply_selections;
 use crate::audio::spectrogram;
 use crate::audio::types::{AudioData, Selection, SelectionAction, Spectrogram};
 use crate::playback::PlaybackHandle;
 use crate::ui::spectrogram_view::SpectrogramView;
 
+/// Debounce for re-rendering the preview while the user drags a region.
+///
+/// Edits arrive every UI frame (~60 Hz) during a drag. Rendering the full track
+/// per frame would swamp the worker, so we wait for the pointer to settle
+/// instead, then do one incremental render.
+const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(60);
+
+/// The decoded track plus its analysis.
+///
+/// `audio` is an `Arc` so handing the worker thread a copy for preview/export
+/// rendering is a refcount bump, not a clone of the sample buffer. The original
+/// code cloned the whole `Vec<f32>` on every play, edit and export.
 struct LoadedAudio {
     path: PathBuf,
-    audio: AudioData,
+    audio: Arc<AudioData>,
+    /// The dry interleaved samples, shared with the mixer for unprocessed
+    /// playback. Built once at load so starting playback is a refcount bump;
+    /// the mixer only ever reads it.
+    dry_samples: Arc<Vec<f32>>,
     spectrogram: Spectrogram,
     texture: egui::TextureHandle,
 }
 
 enum LoadMessage {
-    Loaded(Result<(PathBuf, AudioData, Spectrogram, egui::ColorImage), String>),
+    Loaded(Result<(PathBuf, Arc<AudioData>, Spectrogram, egui::ColorImage), String>),
+}
+
+/// Work request for the background preview/export worker.
+enum WorkerJob {
+    /// Re-render the (fast, IIR-based) preview from the current selections.
+    Preview {
+        audio: Arc<AudioData>,
+        selections: Vec<Selection>,
+    },
+    /// Exact STFT render for writing a WAV file.
+    Export {
+        audio: Arc<AudioData>,
+        selections: Vec<Selection>,
+        path: PathBuf,
+    },
+}
+
+enum WorkerMessage {
+    /// Preview render finished; carries the interleaved samples plus which frame
+    /// span was recomputed, so playback can resume without a position reset.
+    PreviewDone {
+        samples: Arc<Vec<f32>>,
+        changed_frames: Option<(usize, usize)>,
+        full_rebuild: bool,
+    },
+    ExportDone(Result<(), String>),
 }
 
 pub struct SpectrimApp {
     loaded: Option<LoadedAudio>,
     status: String,
     load_receiver: Option<Receiver<LoadMessage>>,
-    processing_receiver: Option<Receiver<Vec<f32>>>,
-    export_receiver: Option<Receiver<Result<(), String>>>,
+    /// Sender end of the persistent worker; `None` when no worker is running.
+    worker_sender: Option<mpsc::Sender<WorkerJob>>,
+    worker_receiver: Option<Receiver<WorkerMessage>>,
+    worker_busy: bool,
+    /// True while an export is in flight (preview results must not disturb it).
+    export_in_flight: bool,
     playback: PlaybackHandle,
     is_playing: bool,
     paused: bool,
+    /// Logical play position when not playing, or the position playback started
+    /// from when playing (the device counter is added on top).
     playhead_time: f32,
     processed_mode: bool,
-    processed_samples: Option<Vec<f32>>,
+    /// Rendered preview samples, shared with the playback thread.
+    preview_samples: Option<Arc<Vec<f32>>>,
+    /// Cache living on the worker thread; the UI only keeps the last result.
+    preview_cache: PreviewCache,
+    /// Set when a preview render has been requested but not yet dispatched.
+    preview_dirty: bool,
+    /// When the last edit happened, for debouncing.
+    last_edit: Option<Instant>,
     selections: Vec<Selection>,
     selected_selection: Option<u64>,
     next_selection_id: u64,
@@ -49,14 +106,19 @@ impl Default for SpectrimApp {
             loaded: None,
             status: "Open a WAV, MP3, FLAC, or Ogg audio file to begin.".to_owned(),
             load_receiver: None,
-            processing_receiver: None,
-            export_receiver: None,
+            worker_sender: None,
+            worker_receiver: None,
+            worker_busy: false,
+            export_in_flight: false,
             playback: PlaybackHandle::spawn(),
             is_playing: false,
             paused: false,
             playhead_time: 0.0,
             processed_mode: false,
-            processed_samples: None,
+            preview_samples: None,
+            preview_cache: PreviewCache::new(),
+            preview_dirty: false,
+            last_edit: None,
             selections: Vec::new(),
             selected_selection: None,
             next_selection_id: 1,
@@ -72,6 +134,10 @@ impl SpectrimApp {
         self.is_playing = false;
         self.paused = false;
         self.playhead_time = 0.0;
+        self.preview_samples = None;
+        self.preview_cache = PreviewCache::new();
+        self.stop_worker();
+
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
         self.status = format!("Loading and analyzing {}…", path.display());
@@ -79,6 +145,7 @@ impl SpectrimApp {
             let result = decode_file(&path)
                 .map_err(|error| error.to_string())
                 .map(|audio| {
+                    let audio = Arc::new(audio);
                     let spec = spectrogram::compute(&audio, 2048, 512);
                     println!(
                         "Spectrogram: {} × {} (frequency bins × time frames)",
@@ -89,6 +156,75 @@ impl SpectrimApp {
                 });
             let _ = sender.send(LoadMessage::Loaded(result));
         });
+    }
+
+    /// Start the persistent preview/export worker.
+    fn start_worker(&mut self) {
+        if self.worker_sender.is_some() {
+            return;
+        }
+        let (job_tx, job_rx) = mpsc::channel::<WorkerJob>();
+        let (msg_tx, msg_rx) = mpsc::channel::<WorkerMessage>();
+        let mut cache = PreviewCache::new();
+        self.worker_sender = Some(job_tx);
+        self.worker_receiver = Some(msg_rx);
+        // Move the existing cache into the worker so a reload is not needed.
+        std::mem::swap(&mut cache, &mut self.preview_cache);
+        thread::spawn(move || {
+            let mut cache = cache;
+            while let Ok(job) = job_rx.recv() {
+                match job {
+                    WorkerJob::Preview { audio, selections } => {
+                        let outcome: PreviewOutcome = cache.render(&audio, &selections);
+                        let samples = Arc::new(cache.samples.clone());
+                        let _ = msg_tx.send(WorkerMessage::PreviewDone {
+                            samples,
+                            changed_frames: outcome.changed_frames,
+                            full_rebuild: outcome.full_rebuild,
+                        });
+                    }
+                    WorkerJob::Export {
+                        audio,
+                        selections,
+                        path,
+                    } => {
+                        // Export stays exact: full STFT masking, not the IIR preview.
+                        let samples = apply_selections(&audio, &selections);
+                        let result =
+                            export_wav(&path, &samples, audio.sample_rate, audio.channels)
+                                .map_err(|error| format!("WAV export failed: {error}"));
+                        let _ = msg_tx.send(WorkerMessage::ExportDone(result));
+                    }
+                }
+            }
+        });
+    }
+
+    fn stop_worker(&mut self) {
+        self.worker_sender = None;
+        self.worker_receiver = None;
+        self.worker_busy = false;
+        self.export_in_flight = false;
+    }
+
+    /// Ask the worker to re-render the preview from the current selections.
+    ///
+    /// Called after any edit; the actual render happens on the worker thread and
+    /// the result is applied in `poll_workers`, which is what keeps the
+    /// playhead from resetting.
+    fn request_preview(&mut self) {
+        // Take the Arc first and end the borrow, otherwise `start_worker` cannot
+        // borrow `self` mutably.
+        let Some(audio) = self.loaded.as_ref().map(|loaded| Arc::clone(&loaded.audio)) else {
+            return;
+        };
+        self.start_worker();
+        let Some(sender) = self.worker_sender.clone() else {
+            return;
+        };
+        let selections = self.selections.clone();
+        self.preview_dirty = true;
+        let _ = sender.send(WorkerJob::Preview { audio, selections });
     }
 
     fn poll_workers(&mut self, ctx: &egui::Context) {
@@ -102,64 +238,74 @@ impl SpectrimApp {
                 Ok((path, audio, spec, image)) => {
                     let texture =
                         ctx.load_texture("spectrogram", image, egui::TextureOptions::LINEAR);
+                    let dry_samples = Arc::new(audio.samples.clone());
                     self.loaded = Some(LoadedAudio {
                         path,
                         audio,
+                        dry_samples,
                         spectrogram: spec,
                         texture,
                     });
                     self.playhead_time = 0.0;
                     self.spectrogram_view = SpectrogramView::default();
                     self.selections.clear();
-                    self.processed_samples = None;
+                    self.preview_samples = None;
+                    self.preview_cache = PreviewCache::new();
                     self.status = "Audio loaded successfully.".to_owned();
                 }
                 Err(error) => self.status = error,
             }
         }
 
-        let processed = self
-            .processing_receiver
+        let message = self
+            .worker_receiver
             .as_ref()
             .and_then(|receiver| receiver.try_recv().ok());
-        if let Some(samples) = processed {
-            self.processing_receiver = None;
-            self.processed_samples = Some(samples);
-            if let Some(loaded) = &self.loaded {
-                if self.processed_mode {
-                    if let Some(samples) = &self.processed_samples {
-                        let start_frame = (self.playhead_time * loaded.audio.sample_rate as f32)
-                            as usize
-                            * loaded.audio.channels as usize;
-                        self.playback.play(
-                            samples[start_frame.min(samples.len())..].to_vec(),
-                            loaded.audio.sample_rate,
-                            loaded.audio.channels,
-                        );
-                        self.is_playing = true;
-                        self.paused = false;
+        match message {
+            Some(WorkerMessage::PreviewDone {
+                samples,
+                changed_frames,
+                full_rebuild,
+            }) => {
+                self.preview_dirty = false;
+                self.preview_samples = Some(Arc::clone(&samples));
+
+                // Playback continuity: if we are playing in edited mode, hand the
+                // new buffer to the mixer *without* restarting it, so the
+                // position is preserved. The device keeps its absolute frame
+                // index; only the samples under it change.
+                if self.processed_mode && self.is_playing && !self.paused {
+                    self.playback.update_buffer(Arc::clone(&samples));
+                    if full_rebuild || changed_frames.is_some() {
+                        self.status = "Preview updated (playing position preserved).".to_owned();
                     }
+                } else {
+                    self.status = "Preview updated.".to_owned();
                 }
             }
-            self.status = "Audio processing complete.".to_owned();
+            Some(WorkerMessage::ExportDone(result)) => {
+                self.export_in_flight = false;
+                self.worker_busy = false;
+                self.status = match result {
+                    Ok(()) => "WAV export completed.".to_owned(),
+                    Err(error) => error,
+                };
+            }
+            None => {}
         }
 
-        let exported = self
-            .export_receiver
-            .as_ref()
-            .and_then(|receiver| receiver.try_recv().ok());
-        if let Some(result) = exported {
-            self.export_receiver = None;
-            self.status = match result {
-                Ok(()) => "WAV export completed.".to_owned(),
-                Err(error) => error,
-            };
+        if self.load_receiver.is_some() || self.worker_receiver.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(30));
         }
-        if self.load_receiver.is_some()
-            || self.processing_receiver.is_some()
-            || self.export_receiver.is_some()
-        {
-            ctx.request_repaint_after(Duration::from_millis(50));
+    }
+
+    /// The buffer the mixer should be playing right now.
+    fn active_samples(&self) -> Option<Arc<Vec<f32>>> {
+        if self.processed_mode {
+            self.preview_samples.clone()
+        } else {
+            // Share the decoded buffer directly; the mixer only reads it.
+            self.loaded.as_ref().map(|loaded| Arc::clone(&loaded.dry_samples))
         }
     }
 
@@ -167,96 +313,157 @@ impl SpectrimApp {
         let Some(loaded) = &self.loaded else {
             return;
         };
-        if !self.processed_mode {
-            let start_frame = (self.playhead_time * loaded.audio.sample_rate as f32) as usize
-                * loaded.audio.channels as usize;
-            self.playback.play(
-                loaded.audio.samples[start_frame.min(loaded.audio.samples.len())..].to_vec(),
-                loaded.audio.sample_rate,
-                loaded.audio.channels,
-            );
-            self.is_playing = true;
-            self.paused = false;
-        } else if let Some(samples) = &self.processed_samples {
-            let start_frame = (self.playhead_time * loaded.audio.sample_rate as f32) as usize
-                * loaded.audio.channels as usize;
-            self.playback.play(
-                samples[start_frame.min(samples.len())..].to_vec(),
-                loaded.audio.sample_rate,
-                loaded.audio.channels,
-            );
-            self.is_playing = true;
-            self.paused = false;
+
+        // In edited mode we need a preview render before we can start. If the
+        // selections have never been rendered, kick one off and wait for it;
+        // otherwise play immediately from the cached buffer.
+        if self.processed_mode && self.preview_samples.is_none() {
+            self.request_preview();
+            self.status = "Rendering preview…".to_owned();
+            return;
+        }
+
+        let Some(samples) = self.active_samples() else {
+            return;
+        };
+        self.playback.play_from(
+            samples,
+            loaded.audio.sample_rate,
+            loaded.audio.channels,
+            self.playhead_time,
+        );
+        self.is_playing = true;
+        self.paused = false;
+    }
+
+    fn pause(&mut self) {
+        // Latch the device position into `playhead_time` *before* pausing so
+        // `current_time()` stays continuous across the transition (it reads the
+        // device while playing and the latch while stopped).
+        if self.is_playing {
+            self.playhead_time = self.playback.position();
+        }
+        self.playback.pause();
+        self.is_playing = false;
+        self.paused = true;
+    }
+
+    fn stop(&mut self) {
+        self.playback.stop();
+        self.is_playing = false;
+        self.paused = false;
+        self.playhead_time = 0.0;
+    }
+
+    /// Seek while (possibly) playing: move the device position, do not rebuild
+    /// the sink, do not touch the preview buffer.
+    fn seek(&mut self, time: f32) {
+        let Some(loaded) = &self.loaded else {
+            self.playhead_time = time;
+            return;
+        };
+        let clamped = time.clamp(0.0, loaded.audio.duration);
+        self.playhead_time = clamped;
+        if self.is_playing {
+            // Move the device's frame index in place: no sink rebuild, no buffer
+            // re-feed, so scrubbing the notch while playing stays smooth and the
+            // edited audio underneath is unaffected.
+            self.playback.seek(clamped, loaded.audio.sample_rate);
+        }
+    }
+
+    /// Current playhead time in seconds.
+    ///
+    /// While playing, the device's absolute frame counter *is* the position —
+    /// the mixer is fed the whole track, so `playback.position()` is already
+    /// track-relative. Adding `playhead_time` on top (as the pre-rewrite code
+    /// did, back when position was an elapsed-since-start delta) would
+    /// double-count and run the playhead at up to 2× speed.
+    /// `playhead_time` is the remembered position used when playback is not
+    /// running: after a pause, a seek while stopped, or a natural end.
+    fn current_time(&self) -> f32 {
+        if self.is_playing {
+            self.playback.position()
         } else {
-            let (sender, receiver) = mpsc::channel();
-            let audio = AudioData {
-                samples: loaded.audio.samples.clone(),
-                sample_rate: loaded.audio.sample_rate,
-                channels: loaded.audio.channels,
-                duration: loaded.audio.duration,
-            };
-            let selections = self.selections.clone();
-            self.processing_receiver = Some(receiver);
-            self.status = "Processing edited audio…".to_owned();
-            thread::spawn(move || {
-                let _ = sender.send(apply_selections(&audio, &selections));
-            });
+            self.playhead_time
         }
     }
 
     fn export(&mut self, path: PathBuf) {
-        let Some(loaded) = &self.loaded else {
+        let Some(audio) = self.loaded.as_ref().map(|loaded| Arc::clone(&loaded.audio)) else {
             return;
         };
-        let audio = AudioData {
-            samples: loaded.audio.samples.clone(),
-            sample_rate: loaded.audio.sample_rate,
-            channels: loaded.audio.channels,
-            duration: loaded.audio.duration,
+        self.start_worker();
+        let Some(sender) = self.worker_sender.clone() else {
+            return;
         };
         let selections = self.selections.clone();
-        let (sender, receiver) = mpsc::channel();
-        self.export_receiver = Some(receiver);
+        self.export_in_flight = true;
+        self.worker_busy = true;
         self.status = "Processing and exporting WAV…".to_owned();
-        thread::spawn(move || {
-            let samples = apply_selections(&audio, &selections);
-            let result = export_wav(&path, &samples, audio.sample_rate, audio.channels)
-                .map_err(|error| format!("WAV export failed: {error}"));
-            let _ = sender.send(result);
+        let _ = sender.send(WorkerJob::Export {
+            audio,
+            selections,
+            path,
         });
     }
 
+    /// An edit happened. Unlike the original, this does **not** stop playback and
+    /// does **not** reset the playhead; it schedules a debounced incremental
+    /// preview render and lets the mixer swap buffers underneath.
     fn selections_changed(&mut self) {
-        self.processed_samples = None;
-        if self.processed_mode {
-            if self.is_playing {
-                self.playhead_time += self.playback.position();
-            }
-            self.playback.stop();
-            self.is_playing = false;
-            self.paused = false;
+        self.last_edit = Some(Instant::now());
+        self.preview_dirty = true;
+    }
+
+    /// Flush a pending debounced preview request.
+    fn flush_preview_debounce(&mut self, ctx: &egui::Context) {
+        if !self.preview_dirty {
+            return;
         }
+        // An export owns the worker's attention; defer preview work until it is
+        // done so the two jobs cannot interleave on the same cache.
+        if self.export_in_flight {
+            ctx.request_repaint_after(PREVIEW_DEBOUNCE);
+            return;
+        }
+        let Some(last) = self.last_edit else {
+            return;
+        };
+        if last.elapsed() < PREVIEW_DEBOUNCE {
+            ctx.request_repaint_after(PREVIEW_DEBOUNCE - last.elapsed());
+            return;
+        }
+        self.preview_dirty = false;
+        self.last_edit = None;
+        self.request_preview();
     }
 }
 
 impl eframe::App for SpectrimApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_workers(ctx);
-        let processing = self.processing_receiver.is_some() || self.export_receiver.is_some();
-        let current_time = if self.is_playing {
-            self.playhead_time + self.playback.position()
-        } else {
-            self.playhead_time
-        };
+        self.flush_preview_debounce(ctx);
+
+        let processing = self.export_in_flight || self.preview_dirty;
         let duration = self
             .loaded
             .as_ref()
             .map_or(0.0, |loaded| loaded.audio.duration);
-        if self.is_playing && duration > 0.0 && current_time >= duration {
+
+        // Natural end of track: the mixer source ran out and the audio thread
+        // dropped the sink. Ask the device rather than comparing times, so a
+        // seek to near-the-end cannot be mistaken for a finished track.
+        if self.is_playing && !self.playback.is_active() {
+            self.playhead_time = if duration > 0.0 {
+                duration
+            } else {
+                self.playback.position()
+            };
             self.is_playing = false;
             self.paused = false;
-            self.playhead_time = duration;
         }
+        let current_time = self.current_time();
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -274,25 +481,22 @@ impl eframe::App for SpectrimApp {
                     current_time,
                     duration,
                     &mut self.processed_mode,
-                    self.loaded.is_some() && !processing,
+                    self.loaded.is_some() && !self.export_in_flight,
                 );
                 if events.play {
                     if self.paused {
                         self.paused = false;
+                        self.playback.resume();
+                        self.is_playing = true;
+                    } else {
+                        self.play();
                     }
-                    self.play();
                 }
                 if events.pause {
-                    self.playhead_time = current_time;
-                    self.playback.stop();
-                    self.is_playing = false;
-                    self.paused = true;
+                    self.pause();
                 }
                 if events.stop {
-                    self.playback.stop();
-                    self.is_playing = false;
-                    self.paused = false;
-                    self.playhead_time = 0.0;
+                    self.stop();
                 }
                 ui.separator();
                 ui.label("New selection:");
@@ -301,7 +505,7 @@ impl eframe::App for SpectrimApp {
                 ui.selectable_value(&mut self.default_action, SelectionAction::Gain, "Gain");
                 if ui
                     .add_enabled(
-                        self.loaded.is_some() && !processing,
+                        self.loaded.is_some() && !self.export_in_flight,
                         egui::Button::new("Export WAV…"),
                     )
                     .clicked()
@@ -363,24 +567,7 @@ impl eframe::App for SpectrimApp {
                     selections_modified = true;
                 }
                 if let Some(time) = events.seek_to {
-                    self.playhead_time = time.clamp(0.0, loaded.audio.duration);
-                    if self.is_playing {
-                        let start_frame = (self.playhead_time * loaded.audio.sample_rate as f32)
-                            as usize
-                            * loaded.audio.channels as usize;
-                        let samples = if self.processed_mode {
-                            self.processed_samples
-                                .as_ref()
-                                .unwrap_or(&loaded.audio.samples)
-                        } else {
-                            &loaded.audio.samples
-                        };
-                        self.playback.play(
-                            samples[start_frame.min(samples.len())..].to_vec(),
-                            loaded.audio.sample_rate,
-                            loaded.audio.channels,
-                        );
-                    }
+                    self.seek(time);
                 }
                 if let Some((time_start, time_end, freq_low, freq_high, full_band)) = events.created
                 {
@@ -423,18 +610,16 @@ impl eframe::App for SpectrimApp {
             });
         });
 
-        if self.is_playing {
+        if self.is_playing || self.preview_dirty {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
         if ctx.input(|input| input.key_pressed(egui::Key::Space)) {
             if self.is_playing {
-                self.playback.stop();
-                self.playhead_time = current_time;
-                self.is_playing = false;
-                self.paused = true;
+                self.pause();
             } else if self.paused {
                 self.paused = false;
-                self.play();
+                self.playback.resume();
+                self.is_playing = true;
             } else {
                 self.play();
             }

@@ -86,7 +86,7 @@ pub enum SelectionAction {
     Gain,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Selection {
     pub id: u64,
     pub time_start: f32,

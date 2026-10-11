@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use rustfft::num_complex::Complex32;
 use rustfft::FftPlanner;
 
@@ -21,22 +22,32 @@ pub fn compute(audio: &AudioData, n_fft: usize, hop: usize) -> Spectrogram {
 
     let n_time = (mono.len() - n_fft) / hop + 1;
     let window = hann_window(n_fft);
+    // rustfft 6 plans are Send + Sync, so one shared forward plan serves every
+    // worker; each frame gets its own scratch spectrum inside the map closure.
     let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(n_fft);
-    let mut matrix = vec![0.0; n_freq * n_time];
-    let mut frame = vec![Complex32::default(); n_fft];
-    let mut magnitudes = vec![0.0; n_freq];
 
-    for time in 0..n_time {
-        let start = time * hop;
-        for index in 0..n_fft {
-            frame[index] = Complex32::new(mono[start + index] * window[index], 0.0);
-        }
-        fft.process(&mut frame);
-        for frequency in 0..n_freq {
-            let magnitude = frame[frequency].norm();
-            let db = 20.0 * (magnitude + 1.0e-9).log10();
-            magnitudes[frequency] = db;
+    // Frames are fully independent, so the whole STFT is a parallel map. Each
+    // item yields one time frame's dB column; the scatter into the
+    // frequency-major matrix happens afterwards in a cheap sequential pass.
+    let columns: Vec<Vec<f32>> = (0..n_time)
+        .into_par_iter()
+        .map(|time| {
+            let start = time * hop;
+            let mut frame = vec![Complex32::default(); n_fft];
+            for index in 0..n_fft {
+                frame[index] = Complex32::new(mono[start + index] * window[index], 0.0);
+            }
+            fft.process(&mut frame);
+            (0..n_freq)
+                .map(|frequency| 20.0 * (frame[frequency].norm() + 1.0e-9).log10())
+                .collect()
+        })
+        .collect();
+
+    let mut matrix = vec![0.0f32; n_freq * n_time];
+    for (time, column) in columns.into_iter().enumerate() {
+        for (frequency, db) in column.into_iter().enumerate() {
             matrix[frequency * n_time + time] = db;
         }
     }
@@ -54,13 +65,166 @@ pub fn compute(audio: &AudioData, n_fft: usize, hop: usize) -> Spectrogram {
     }
 }
 
+/// 5th/95th percentile of the dB distribution, used to normalise the colormap.
+///
+/// This used to clone the whole matrix and fully sort it — O(n log n) over tens
+/// of millions of floats, and it was the dominant tail of load time on long
+/// tracks. A fixed-bin histogram reduced in parallel gives the same percentiles
+/// for colour-mapping purposes in O(n), which is plenty accurate here: the
+/// values only drive a normalisation range, not audio.
 fn compute_db_range(matrix: &[f32]) -> (f32, f32) {
+    const BINS: usize = 4096;
     if matrix.is_empty() {
         return (0.0, 0.0);
     }
-    let mut sorted = matrix.to_vec();
-    sorted.sort_by(f32::total_cmp);
-    let low = ((sorted.len() - 1) as f32 * 0.05).round() as usize;
-    let high = ((sorted.len() - 1) as f32 * 0.95).round() as usize;
-    (sorted[low], sorted[high])
+
+    let (min, max) = matrix
+        .par_iter()
+        .fold(
+            || (f32::INFINITY, f32::NEG_INFINITY),
+            |(lo, hi), value| (lo.min(*value), hi.max(*value)),
+        )
+        .reduce(
+            || (f32::INFINITY, f32::NEG_INFINITY),
+            |(a_lo, a_hi), (b_lo, b_hi)| (a_lo.min(b_lo), a_hi.max(b_hi)),
+        );
+    let span = max - min;
+    if !span.is_finite() || span < 1.0e-6 {
+        return (min, max);
+    }
+
+    let scale = (BINS - 1) as f32 / span;
+    let chunk = (matrix.len() / (rayon::current_num_threads() * 4).max(1) + 1).max(1);
+    let total: Vec<u64> = matrix
+        .par_chunks(chunk)
+        .map(|chunk| {
+            let mut histogram = vec![0u64; BINS];
+            for value in chunk {
+                let bin = (((value - min) * scale).round() as usize).min(BINS - 1);
+                histogram[bin] += 1;
+            }
+            histogram
+        })
+        .reduce_with(|mut a, b| {
+            for (slot, count) in a.iter_mut().zip(b.into_iter()) {
+                *slot += count;
+            }
+            a
+        })
+        .unwrap_or_else(|| vec![0u64; BINS]);
+
+    let percentile = |fraction: f64| {
+        let target = (matrix.len() as f64 * fraction) as u64;
+        let mut cumulative = 0u64;
+        for (bin, count) in total.iter().enumerate() {
+            cumulative += count;
+            if cumulative > target {
+                return min + bin as f32 / scale;
+            }
+        }
+        max
+    };
+    (percentile(0.05), percentile(0.95))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_audio(frames: usize, sample_rate: u32) -> AudioData {
+        AudioData {
+            samples: (0..frames)
+                .map(|i| ((i as f32 * 0.01).sin() + (i as f32 * 0.13).cos() * 0.5))
+                .collect(),
+            sample_rate,
+            channels: 1,
+            duration: frames as f32 / sample_rate as f32,
+        }
+    }
+
+    #[test]
+    fn spectrogram_shape_and_peak_bin_are_sane() {
+        let sample_rate = 8000;
+        let frames = 16_000;
+        let audio = AudioData {
+            samples: (0..frames)
+                .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin())
+                .collect(),
+            sample_rate,
+            channels: 1,
+            duration: frames as f32 / sample_rate as f32,
+        };
+        let spec = compute(&audio, 512, 128);
+        assert_eq!(spec.n_freq, 257);
+        assert_eq!(spec.n_time, (frames - 512) / 128 + 1);
+        assert!(spec.db_min < spec.db_max);
+
+        let peak_bin = (0..spec.n_freq)
+            .map(|bin| {
+                let energy: f32 = (0..spec.n_time).map(|t| spec.at(bin, t)).sum();
+                (bin, energy)
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(bin, _)| bin)
+            .unwrap();
+        let peak_hz = spec.bin_to_hz(peak_bin);
+        assert!((peak_hz - 440.0).abs() < 40.0, "peak at {peak_hz} Hz");
+    }
+
+    #[test]
+    fn parallel_compute_matches_sequential_reference() {
+        let audio = test_audio(4_000, 8_000);
+        let spec = compute(&audio, 256, 64);
+
+        // Straightforward single-threaded reference implementation.
+        let mono = audio.to_mono();
+        let window = hann_window(256);
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(256);
+        let n_freq = 129;
+        let n_time = (mono.len() - 256) / 64 + 1;
+        let mut max_err = 0.0f32;
+        let mut frame = vec![Complex32::default(); 256];
+        for time in 0..n_time {
+            let start = time * 64;
+            for index in 0..256 {
+                frame[index] = Complex32::new(mono[start + index] * window[index], 0.0);
+            }
+            fft.process(&mut frame);
+            for frequency in 0..n_freq {
+                let db = 20.0 * (frame[frequency].norm() + 1.0e-9).log10();
+                max_err = max_err.max((db - spec.at(frequency, time)).abs());
+            }
+        }
+        assert!(max_err < 1.0e-3, "parallel spectrogram drift {max_err}");
+    }
+
+    #[test]
+    fn db_range_brackets_the_bulk_of_values() {
+        let audio = test_audio(40_000, 44_100);
+        let spec = compute(&audio, 512, 128);
+        assert!(spec.db_min.is_finite() && spec.db_max.is_finite());
+        assert!(spec.db_min < spec.db_max);
+        // Percentiles must sit inside the true min/max.
+        let true_min = spec
+            .matrix
+            .iter()
+            .fold(f32::INFINITY, |a, b| a.min(*b));
+        let true_max = spec
+            .matrix
+            .iter()
+            .fold(f32::NEG_INFINITY, |a, b| a.max(*b));
+        assert!(spec.db_min >= true_min - 1.0e-3);
+        assert!(spec.db_max <= true_max + 1.0e-3);
+        // 5th percentile should be above the true minimum for real audio.
+        assert!(spec.db_min > true_min);
+    }
+
+    #[test]
+    fn empty_or_short_audio_returns_empty_spectrogram() {
+        let audio = test_audio(100, 44_100);
+        let spec = compute(&audio, 512, 128);
+        assert_eq!(spec.n_time, 0);
+        assert!(spec.matrix.is_empty());
+    }
 }
