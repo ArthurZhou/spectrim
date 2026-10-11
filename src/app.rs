@@ -39,6 +39,7 @@ struct LoadedAudio {
 }
 
 enum LoadMessage {
+    Progress(String),
     Loaded(Result<(PathBuf, Arc<AudioData>, Spectrogram, egui::ColorImage), String>),
 }
 
@@ -64,6 +65,7 @@ enum WorkerMessage {
         samples: Arc<Vec<f32>>,
         changed_frames: Option<(usize, usize)>,
         full_rebuild: bool,
+        spectrogram: Spectrogram,
     },
     ExportDone(Result<(), String>),
 }
@@ -72,6 +74,7 @@ pub struct SpectrimApp {
     loaded: Option<LoadedAudio>,
     status: String,
     load_receiver: Option<Receiver<LoadMessage>>,
+    load_started: Option<Instant>,
     /// Sender end of the persistent worker; `None` when no worker is running.
     worker_sender: Option<mpsc::Sender<WorkerJob>>,
     worker_receiver: Option<Receiver<WorkerMessage>>,
@@ -81,6 +84,7 @@ pub struct SpectrimApp {
     playback: PlaybackHandle,
     is_playing: bool,
     paused: bool,
+    plot_drag_active: bool,
     /// Logical play position when not playing, or the position playback started
     /// from when playing (the device counter is added on top).
     playhead_time: f32,
@@ -106,6 +110,7 @@ impl Default for SpectrimApp {
             loaded: None,
             status: "Open a WAV, MP3, FLAC, or Ogg audio file to begin.".to_owned(),
             load_receiver: None,
+            load_started: None,
             worker_sender: None,
             worker_receiver: None,
             worker_busy: false,
@@ -113,8 +118,9 @@ impl Default for SpectrimApp {
             playback: PlaybackHandle::spawn(),
             is_playing: false,
             paused: false,
+            plot_drag_active: false,
             playhead_time: 0.0,
-            processed_mode: false,
+            processed_mode: true,
             preview_samples: None,
             preview_cache: PreviewCache::new(),
             preview_dirty: false,
@@ -133,6 +139,7 @@ impl SpectrimApp {
         self.playback.stop();
         self.is_playing = false;
         self.paused = false;
+        self.plot_drag_active = false;
         self.playhead_time = 0.0;
         self.preview_samples = None;
         self.preview_cache = PreviewCache::new();
@@ -140,19 +147,39 @@ impl SpectrimApp {
 
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
-        self.status = format!("Loading and analyzing {}…", path.display());
+        self.load_started = Some(Instant::now());
+        self.status = format!("Decoding {}…", path.display());
         thread::spawn(move || {
+            let started = Instant::now();
             let result = decode_file(&path)
                 .map_err(|error| error.to_string())
-                .map(|audio| {
+                .and_then(|audio| {
+                    let decode_time = started.elapsed();
+                    let _ = sender.send(LoadMessage::Progress(format!(
+                        "Decoded in {:.1}s; computing spectrogram…",
+                        decode_time.as_secs_f32()
+                    )));
                     let audio = Arc::new(audio);
+                    let analysis_started = Instant::now();
                     let spec = spectrogram::compute(&audio, 2048, 512);
+                    let analysis_time = analysis_started.elapsed();
                     println!(
-                        "Spectrogram: {} × {} (frequency bins × time frames)",
-                        spec.n_freq, spec.n_time
+                        "Spectrogram: {} × {} in {:.2}s",
+                        spec.n_freq,
+                        spec.n_time,
+                        analysis_time.as_secs_f32()
                     );
+                    let _ = sender.send(LoadMessage::Progress(format!(
+                        "Spectrogram ready in {:.1}s; preparing display…",
+                        analysis_time.as_secs_f32()
+                    )));
+                    let image_started = Instant::now();
                     let image = crate::ui::spectrogram_view::color_image(&spec);
-                    (path, audio, spec, image)
+                    println!(
+                        "Display image prepared in {:.2}s",
+                        image_started.elapsed().as_secs_f32()
+                    );
+                    Ok((path, audio, spec, image))
                 });
             let _ = sender.send(LoadMessage::Loaded(result));
         });
@@ -177,10 +204,18 @@ impl SpectrimApp {
                     WorkerJob::Preview { audio, selections } => {
                         let outcome: PreviewOutcome = cache.render(&audio, &selections);
                         let samples = Arc::new(cache.samples.clone());
+                        let spectrogram = spectrogram::compute_interleaved(
+                            &samples,
+                            audio.channels,
+                            audio.sample_rate,
+                            2048,
+                            512,
+                        );
                         let _ = msg_tx.send(WorkerMessage::PreviewDone {
                             samples,
                             changed_frames: outcome.changed_frames,
                             full_rebuild: outcome.full_rebuild,
+                            spectrogram,
                         });
                     }
                     WorkerJob::Export {
@@ -190,9 +225,8 @@ impl SpectrimApp {
                     } => {
                         // Export stays exact: full STFT masking, not the IIR preview.
                         let samples = apply_selections(&audio, &selections);
-                        let result =
-                            export_wav(&path, &samples, audio.sample_rate, audio.channels)
-                                .map_err(|error| format!("WAV export failed: {error}"));
+                        let result = export_wav(&path, &samples, audio.sample_rate, audio.channels)
+                            .map_err(|error| format!("WAV export failed: {error}"));
                         let _ = msg_tx.send(WorkerMessage::ExportDone(result));
                     }
                 }
@@ -228,32 +262,42 @@ impl SpectrimApp {
     }
 
     fn poll_workers(&mut self, ctx: &egui::Context) {
-        let load_result = self
+        let load_messages = self
             .load_receiver
             .as_ref()
-            .and_then(|receiver| receiver.try_recv().ok());
-        if let Some(LoadMessage::Loaded(result)) = load_result {
-            self.load_receiver = None;
-            match result {
-                Ok((path, audio, spec, image)) => {
-                    let texture =
-                        ctx.load_texture("spectrogram", image, egui::TextureOptions::LINEAR);
-                    let dry_samples = Arc::new(audio.samples.clone());
-                    self.loaded = Some(LoadedAudio {
-                        path,
-                        audio,
-                        dry_samples,
-                        spectrogram: spec,
-                        texture,
-                    });
-                    self.playhead_time = 0.0;
-                    self.spectrogram_view = SpectrogramView::default();
-                    self.selections.clear();
-                    self.preview_samples = None;
-                    self.preview_cache = PreviewCache::new();
-                    self.status = "Audio loaded successfully.".to_owned();
+            .map(|receiver| receiver.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for message in load_messages {
+            match message {
+                LoadMessage::Progress(message) => self.status = message,
+                LoadMessage::Loaded(result) => {
+                    self.load_receiver = None;
+                    self.load_started = None;
+                    match result {
+                        Ok((path, audio, spec, image)) => {
+                            let texture = ctx.load_texture(
+                                "spectrogram",
+                                image,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            let dry_samples = Arc::new(audio.samples.clone());
+                            self.loaded = Some(LoadedAudio {
+                                path,
+                                audio,
+                                dry_samples,
+                                spectrogram: spec,
+                                texture,
+                            });
+                            self.playhead_time = 0.0;
+                            self.spectrogram_view = SpectrogramView::default();
+                            self.selections.clear();
+                            self.preview_samples = None;
+                            self.preview_cache = PreviewCache::new();
+                            self.status = "Audio loaded successfully.".to_owned();
+                        }
+                        Err(error) => self.status = error,
+                    }
                 }
-                Err(error) => self.status = error,
             }
         }
 
@@ -266,9 +310,15 @@ impl SpectrimApp {
                 samples,
                 changed_frames,
                 full_rebuild,
+                spectrogram: edited_spectrogram,
             }) => {
                 self.preview_dirty = false;
                 self.preview_samples = Some(Arc::clone(&samples));
+                if let Some(loaded) = &mut self.loaded {
+                    let image = crate::ui::spectrogram_view::color_image(&edited_spectrogram);
+                    loaded.texture.set(image, egui::TextureOptions::LINEAR);
+                    loaded.spectrogram = edited_spectrogram;
+                }
 
                 // Playback continuity: if we are playing in edited mode, hand the
                 // new buffer to the mixer *without* restarting it, so the
@@ -297,6 +347,9 @@ impl SpectrimApp {
         if self.load_receiver.is_some() || self.worker_receiver.is_some() {
             ctx.request_repaint_after(Duration::from_millis(30));
         }
+        if self.load_started.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
     }
 
     /// The buffer the mixer should be playing right now.
@@ -305,7 +358,9 @@ impl SpectrimApp {
             self.preview_samples.clone()
         } else {
             // Share the decoded buffer directly; the mixer only reads it.
-            self.loaded.as_ref().map(|loaded| Arc::clone(&loaded.dry_samples))
+            self.loaded
+                .as_ref()
+                .map(|loaded| Arc::clone(&loaded.dry_samples))
         }
     }
 
@@ -346,13 +401,6 @@ impl SpectrimApp {
         self.playback.pause();
         self.is_playing = false;
         self.paused = true;
-    }
-
-    fn stop(&mut self) {
-        self.playback.stop();
-        self.is_playing = false;
-        self.paused = false;
-        self.playhead_time = 0.0;
     }
 
     /// Seek while (possibly) playing: move the device position, do not rebuild
@@ -484,19 +532,11 @@ impl eframe::App for SpectrimApp {
                     self.loaded.is_some() && !self.export_in_flight,
                 );
                 if events.play {
-                    if self.paused {
-                        self.paused = false;
-                        self.playback.resume();
-                        self.is_playing = true;
-                    } else {
-                        self.play();
-                    }
+                    self.paused = false;
+                    self.play();
                 }
                 if events.pause {
                     self.pause();
-                }
-                if events.stop {
-                    self.stop();
                 }
                 ui.separator();
                 ui.label("New selection:");
@@ -566,6 +606,18 @@ impl eframe::App for SpectrimApp {
                 if events.selections_changed {
                     selections_modified = true;
                 }
+                if events.drag_started {
+                    self.plot_drag_active = true;
+                    if self.is_playing {
+                        self.playback.set_muted(true);
+                    }
+                }
+                if events.drag_stopped {
+                    self.plot_drag_active = false;
+                    if self.is_playing {
+                        self.playback.set_muted(false);
+                    }
+                }
                 if let Some(time) = events.seek_to {
                     self.seek(time);
                 }
@@ -603,7 +655,15 @@ impl eframe::App for SpectrimApp {
 
         egui::TopBottomPanel::bottom("status_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(&self.status);
+                if let Some(started) = self.load_started {
+                    ui.label(format!(
+                        "{} ({:.1}s)",
+                        self.status,
+                        started.elapsed().as_secs_f32()
+                    ));
+                } else {
+                    ui.label(&self.status);
+                }
                 if processing {
                     ui.spinner();
                 }
@@ -616,12 +676,17 @@ impl eframe::App for SpectrimApp {
         if ctx.input(|input| input.key_pressed(egui::Key::Space)) {
             if self.is_playing {
                 self.pause();
-            } else if self.paused {
-                self.paused = false;
-                self.playback.resume();
-                self.is_playing = true;
             } else {
+                self.paused = false;
                 self.play();
+            }
+        }
+        if self.plot_drag_active
+            && !ctx.input(|input| input.pointer.button_down(egui::PointerButton::Primary))
+        {
+            self.plot_drag_active = false;
+            if self.is_playing {
+                self.playback.set_muted(false);
             }
         }
         if ctx.input(|input| input.key_pressed(egui::Key::Delete)) {

@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use std::fs::File;
 use std::path::Path;
 
@@ -63,6 +64,7 @@ pub fn decode_file(path: &Path) -> Result<AudioData, DecodeError> {
         })
         .ok_or_else(|| DecodeError::UnsupportedFormat("no audio track found".to_owned()))?;
     let track_id = track.id;
+    let estimated_frames = track.codec_params.n_frames;
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|error| DecodeError::UnsupportedFormat(error.to_string()))?;
@@ -70,6 +72,17 @@ pub fn decode_file(path: &Path) -> Result<AudioData, DecodeError> {
     let mut decoded_samples = Vec::<f32>::new();
     let mut source_rate = track.codec_params.sample_rate.unwrap_or(0);
     let mut source_channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(0);
+    if let Some(frames) = estimated_frames {
+        let estimate = usize::try_from(frames)
+            .ok()
+            .and_then(|frames| frames.checked_mul(source_channels.min(2)));
+        if let Some(sample_count) = estimate {
+            // Avoid repeated Vec growth for formats that advertise their frame count.
+            // Cap eager reservation at six hours; longer tracks still grow normally.
+            let max_reserve_samples = 64 * 1024 * 1024 / std::mem::size_of::<f32>();
+            decoded_samples.reserve(sample_count.min(max_reserve_samples));
+        }
+    }
 
     loop {
         let packet = match format.next_packet() {
@@ -106,10 +119,13 @@ pub fn decode_file(path: &Path) -> Result<AudioData, DecodeError> {
         buffer.copy_interleaved_ref(decoded);
         let decoded = buffer.samples();
         let output_channels = source_channels.min(2);
-        for frame in decoded.chunks_exact(source_channels) {
+        if output_channels == source_channels {
+            decoded_samples.extend(decoded.iter().map(|sample| sample.clamp(-1.0, 1.0)));
+        } else {
             decoded_samples.extend(
-                frame[..output_channels]
-                    .iter()
+                decoded
+                    .chunks_exact(source_channels)
+                    .flat_map(|frame| frame[..output_channels].iter())
                     .map(|sample| sample.clamp(-1.0, 1.0)),
             );
         }
@@ -149,17 +165,20 @@ fn resample_linear(
     }
     let input_frames = samples.len() / channels;
     let output_frames = ((input_frames as u64 * target_rate as u64) / source_rate as u64) as usize;
-    let mut output = Vec::with_capacity(output_frames.saturating_mul(channels));
-    for output_frame in 0..output_frames {
-        let position = output_frame as f64 * source_rate as f64 / target_rate as f64;
-        let left = (position.floor() as usize).min(input_frames.saturating_sub(1));
-        let right = (left + 1).min(input_frames.saturating_sub(1));
-        let fraction = (position - left as f64) as f32;
-        for channel in 0..channels {
-            let a = samples[left * channels + channel];
-            let b = samples[right * channels + channel];
-            output.push(a + (b - a) * fraction);
-        }
-    }
+    let mut output = vec![0.0; output_frames.saturating_mul(channels)];
+    output
+        .par_chunks_mut(channels)
+        .enumerate()
+        .for_each(|(output_frame, output_samples)| {
+            let position = output_frame as f64 * source_rate as f64 / target_rate as f64;
+            let left = (position.floor() as usize).min(input_frames.saturating_sub(1));
+            let right = (left + 1).min(input_frames.saturating_sub(1));
+            let fraction = (position - left as f64) as f32;
+            for channel in 0..channels {
+                let a = samples[left * channels + channel];
+                let b = samples[right * channels + channel];
+                output_samples[channel] = a + (b - a) * fraction;
+            }
+        });
     output
 }

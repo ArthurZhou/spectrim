@@ -345,11 +345,7 @@ mod tests {
 
         let mut band = vec![0.0f32; frames];
         band_extract(&mixed, &mut band, 700.0, 1_400.0, sample_rate);
-        let residual: Vec<f32> = mixed
-            .iter()
-            .zip(band.iter())
-            .map(|(a, b)| a - b)
-            .collect();
+        let residual: Vec<f32> = mixed.iter().zip(band.iter()).map(|(a, b)| a - b).collect();
 
         let mid = frames / 4..frames * 3 / 4;
         let residual_rms = rms(&residual[mid.clone()]);
@@ -378,7 +374,10 @@ mod tests {
         ] {
             let mut out = vec![0.0f32; frames];
             band_extract(&input, &mut out, low, high, sample_rate);
-            assert!(out.iter().all(|v| v.is_finite()), "non-finite for {low}..{high}");
+            assert!(
+                out.iter().all(|v| v.is_finite()),
+                "non-finite for {low}..{high}"
+            );
         }
     }
 }

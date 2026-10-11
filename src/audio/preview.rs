@@ -111,7 +111,12 @@ fn resolve_time(selection: &Selection, sample_rate: f32) -> (usize, usize) {
 ///
 /// `ignore_solo` is used for the band-solo path, where full-band solo gating
 /// must not silence the band output.
-fn full_band_factor(resolved: &[Resolved], has_solo: bool, frame_index: usize, ignore_solo: bool) -> Option<f32> {
+fn full_band_factor(
+    resolved: &[Resolved],
+    has_solo: bool,
+    frame_index: usize,
+    ignore_solo: bool,
+) -> Option<f32> {
     let mut gain = 1.0f32;
     let mut in_solo = false;
     let mut in_mute = false;
@@ -264,11 +269,7 @@ fn render_range(
     // Full-band regions only — band regions are layered on top below, and must
     // NOT also be applied as time-domain mutes (that was a double-attenuation
     // bug: a band mute would silence the whole window before subtracting).
-    let full_band: Vec<Selection> = selections
-        .iter()
-        .filter(|s| s.full_band)
-        .cloned()
-        .collect();
+    let full_band: Vec<Selection> = selections.iter().filter(|s| s.full_band).cloned().collect();
     let mut output = render_time_domain(audio, &full_band, start_frame, end_frame);
 
     struct BandRegion<'a> {
@@ -513,7 +514,8 @@ impl PreviewCache {
     /// moved; drop bands whose region was removed. Unchanged bands are kept, so
     /// dragging a region's time window costs zero filtering.
     fn refresh_bands(&mut self, audio: &AudioData, selections: &[Selection], diff: &SelectionDiff) {
-        self.band_signals.retain(|(id, _)| !diff.removed.contains(id));
+        self.band_signals
+            .retain(|(id, _)| !diff.removed.contains(id));
 
         let to_build: Vec<&Selection> = selections
             .iter()
@@ -544,7 +546,11 @@ impl PreviewCache {
             .collect();
 
         for (id, band) in built {
-            if let Some(slot) = self.band_signals.iter_mut().find(|(existing, _)| *existing == id) {
+            if let Some(slot) = self
+                .band_signals
+                .iter_mut()
+                .find(|(existing, _)| *existing == id)
+            {
                 slot.1 = band;
             } else {
                 self.band_signals.push((id, band));
@@ -566,9 +572,7 @@ impl PreviewCache {
         };
 
         for s in &self.selections {
-            if diff.removed.contains(&s.id)
-                || diff.changed.contains(&s.id)
-            {
+            if diff.removed.contains(&s.id) || diff.changed.contains(&s.id) {
                 consider(s);
             }
         }
@@ -584,15 +588,24 @@ impl PreviewCache {
                 .find(|s| &s.id == id)
                 .map(|s| s.action == SelectionAction::Solo)
                 .unwrap_or(false)
-        }) || diff.added_regions.iter().any(|s| s.action == SelectionAction::Solo)
+        }) || diff
+            .added_regions
+            .iter()
+            .any(|s| s.action == SelectionAction::Solo)
             || diff.removed.iter().any(|id| {
                 self.selections
                     .iter()
                     .any(|s| &s.id == id && s.action == SelectionAction::Solo)
             });
         if solo_semantics_changed
-            && (self.selections.iter().any(|s| s.action == SelectionAction::Solo)
-                || diff.added_regions.iter().any(|s| s.action == SelectionAction::Solo))
+            && (self
+                .selections
+                .iter()
+                .any(|s| s.action == SelectionAction::Solo)
+                || diff
+                    .added_regions
+                    .iter()
+                    .any(|s| s.action == SelectionAction::Solo))
         {
             return (0, frames);
         }
@@ -604,8 +617,12 @@ impl PreviewCache {
         // band_extract already handles filter settling for the band signals.
         let guard = 0.02;
         let start_frame = (((start - guard).max(0.0)) * sample_rate).round() as usize;
-        let end_frame = (((end + guard).min(audio.duration.max(end))) * sample_rate).round() as usize;
-        (start_frame.min(frames), end_frame.clamp(start_frame, frames))
+        let end_frame =
+            (((end + guard).min(audio.duration.max(end))) * sample_rate).round() as usize;
+        (
+            start_frame.min(frames),
+            end_frame.clamp(start_frame, frames),
+        )
     }
 }
 
@@ -642,7 +659,11 @@ fn diff_selections(old: &[Selection], new: &[Selection]) -> SelectionDiff {
                 let gain_changed = (o.gain - s.gain).abs() > 1.0e-4;
                 let action_changed = o.action != s.action;
                 let full_band_changed = o.full_band != s.full_band;
-                if band_changed || time_changed || gain_changed || action_changed || full_band_changed
+                if band_changed
+                    || time_changed
+                    || gain_changed
+                    || action_changed
+                    || full_band_changed
                 {
                     diff.changed.push(s.id);
                 }
@@ -804,7 +825,9 @@ mod tests {
         cache.render(&audio1, std::slice::from_ref(&sel));
         let out = cache.render(&audio2, std::slice::from_ref(&sel));
         assert!(out.full_rebuild);
-        assert!(cache.samples[12_000..24_000].iter().all(|v| v.abs() < 1.0e-6));
+        assert!(cache.samples[12_000..24_000]
+            .iter()
+            .all(|v| v.abs() < 1.0e-6));
     }
 
     #[test]
@@ -826,9 +849,7 @@ mod tests {
         let sel = Selection::new(1, 0.25, 0.75, 700.0, 1400.0, SelectionAction::Mute, false);
         let out = render_full(&audio, std::slice::from_ref(&sel));
         // Right channel must stay silent everywhere.
-        assert!(out
-            .chunks_exact(2)
-            .all(|frame| frame[1].abs() < 1.0e-5));
+        assert!(out.chunks_exact(2).all(|frame| frame[1].abs() < 1.0e-5));
         // Left channel must be attenuated inside the window.
         let inside: Vec<f32> = out[33_600..43_200].iter().step_by(2).copied().collect();
         assert!(rms(&inside) < 0.2);

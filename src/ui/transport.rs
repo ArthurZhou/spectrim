@@ -4,7 +4,6 @@ use eframe::egui;
 pub struct TransportEvents {
     pub play: bool,
     pub pause: bool,
-    pub stop: bool,
 }
 
 pub fn show(
@@ -26,9 +25,6 @@ pub fn show(
             } else {
                 events.play = true;
             }
-        }
-        if ui.button("Stop").clicked() {
-            events.stop = true;
         }
     });
     ui.checkbox(processed_mode, "Edited playback");

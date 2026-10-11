@@ -45,7 +45,6 @@ enum AudioCmd {
         samples: Arc<Vec<f32>>,
     },
     Pause,
-    Resume,
     /// Jump to an absolute frame without rebuilding the sink, so scrubbing the
     /// playhead while playing stays smooth.
     Seek {
@@ -66,6 +65,7 @@ struct StreamState {
     /// a swap so exactly one reader picks it up.
     seek_frames: AtomicU64,
     stopped: AtomicBool,
+    muted: AtomicBool,
 }
 
 impl StreamState {
@@ -76,6 +76,7 @@ impl StreamState {
             position_frames: AtomicU64::new(start_frame as u64),
             seek_frames: AtomicU64::new(NO_SEEK),
             stopped: AtomicBool::new(false),
+            muted: AtomicBool::new(false),
         });
         state
     }
@@ -165,14 +166,19 @@ impl Iterator for SwapSource {
             return None;
         }
 
-        let sample = self.buffer[self.index];
+        let sample = if self.state.muted.load(Ordering::Relaxed) {
+            0.0
+        } else {
+            self.buffer[self.index]
+        };
         self.index += 1;
         // Publish position once per complete frame so the UI sees frame-aligned
         // time rather than a channel-interleaved fraction.
         if self.index % self.channels.max(1) == 0 {
-            self.state
-                .position_frames
-                .store((self.index / self.channels.max(1)) as u64, Ordering::Relaxed);
+            self.state.position_frames.store(
+                (self.index / self.channels.max(1)) as u64,
+                Ordering::Relaxed,
+            );
         }
         Some(sample)
     }
@@ -220,6 +226,9 @@ impl PlaybackHandle {
                         channels,
                         start_frame,
                     }) => {
+                        if let Some(current) = thread_state.lock().unwrap().as_ref() {
+                            current.stopped.store(true, Ordering::Relaxed);
+                        }
                         if let Some(old_sink) = sink.take() {
                             old_sink.stop();
                         }
@@ -259,11 +268,6 @@ impl PlaybackHandle {
                     Ok(AudioCmd::Pause) => {
                         if let Some(sink) = &sink {
                             sink.pause();
-                        }
-                    }
-                    Ok(AudioCmd::Resume) => {
-                        if let Some(sink) = &sink {
-                            sink.play();
                         }
                     }
                     Ok(AudioCmd::Stop) => {
@@ -308,6 +312,9 @@ impl PlaybackHandle {
         position_seconds: f32,
     ) {
         let start_frame = (position_seconds.max(0.0) * sample_rate as f32).round() as usize;
+        if let Some(current) = self.state.lock().unwrap().as_ref() {
+            current.stopped.store(true, Ordering::Relaxed);
+        }
         let _ = self.tx.send(AudioCmd::Play {
             samples,
             sample_rate,
@@ -333,11 +340,17 @@ impl PlaybackHandle {
     }
 
     pub fn pause(&self) {
+        if let Some(current) = self.state.lock().unwrap().as_ref() {
+            current.muted.store(true, Ordering::Relaxed);
+        }
         let _ = self.tx.send(AudioCmd::Pause);
     }
 
-    pub fn resume(&self) {
-        let _ = self.tx.send(AudioCmd::Resume);
+    /// Silence the output without interrupting the source or its sample clock.
+    pub fn set_muted(&self, muted: bool) {
+        if let Some(current) = self.state.lock().unwrap().as_ref() {
+            current.muted.store(muted, Ordering::Relaxed);
+        }
     }
 
     /// Absolute play position in seconds, counted in frames actually consumed by

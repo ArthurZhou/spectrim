@@ -1,4 +1,5 @@
 use eframe::egui;
+use rayon::prelude::*;
 
 use crate::audio::types::{AudioData, Selection, SelectionAction, Spectrogram};
 
@@ -13,8 +14,6 @@ const PLAYHEAD_HIT_SLACK: f32 = 3.0;
 
 #[derive(Default)]
 pub struct SpectrogramView {
-    time_range: Option<(f32, f32)>,
-    frequency_range: Option<(f32, f32)>,
     drag: Option<DragMode>,
 }
 
@@ -31,9 +30,6 @@ enum DragMode {
         last: egui::Pos2,
     },
     Playhead,
-    Pan {
-        last: egui::Pos2,
-    },
 }
 
 #[derive(Clone, Copy)]
@@ -50,6 +46,8 @@ pub struct ViewEvents {
     pub selected: Option<Option<u64>>,
     pub seek_to: Option<f32>,
     pub selections_changed: bool,
+    pub drag_started: bool,
+    pub drag_stopped: bool,
 }
 
 impl SpectrogramView {
@@ -78,8 +76,8 @@ impl SpectrogramView {
 
         let duration = audio.duration.max(0.001);
         let nyquist = (audio.sample_rate as f32 * 0.5).max(1.0);
-        let (time_start, time_end) = self.time_range.unwrap_or((0.0, duration));
-        let (freq_low, freq_high) = self.frequency_range.unwrap_or((0.0, nyquist));
+        let (time_start, time_end) = (0.0, duration);
+        let (freq_low, freq_high) = (0.0, nyquist);
         let time_span = (time_end - time_start).max(0.001);
         let freq_span = (freq_high - freq_low).max(1.0);
         let time_to_x = |time: f32| plot.left() + plot.width() * (time - time_start) / time_span;
@@ -120,13 +118,6 @@ impl SpectrogramView {
                 egui::Color32::LIGHT_GRAY,
             );
         }
-        ui.painter().text(
-            egui::pos2(plot.center().x, outer.bottom() - 2.0),
-            egui::Align2::CENTER_BOTTOM,
-            "Time (s)",
-            egui::FontId::proportional(11.0),
-            egui::Color32::LIGHT_GRAY,
-        );
         for index in 0..=5 {
             let fraction = index as f32 / 5.0;
             let hz = freq_low + (1.0 - fraction) * freq_span;
@@ -143,13 +134,6 @@ impl SpectrogramView {
                 egui::Color32::LIGHT_GRAY,
             );
         }
-        ui.painter().text(
-            egui::pos2(outer.left() + 9.0, plot.center().y),
-            egui::Align2::CENTER_CENTER,
-            "Frequency (Hz)",
-            egui::FontId::proportional(11.0),
-            egui::Color32::LIGHT_GRAY,
-        );
         ui.painter().extend(shapes);
 
         for selection in selections.iter() {
@@ -287,6 +271,8 @@ impl SpectrogramView {
             selected: None,
             seek_to: None,
             selections_changed: false,
+            drag_started: false,
+            drag_stopped: false,
         };
 
         let pointer = response.interact_pointer_pos();
@@ -310,42 +296,9 @@ impl SpectrogramView {
             }
         }
 
-        if response.hovered() {
-            let (scroll, zoom_frequency) =
-                ui.input(|input| (input.smooth_scroll_delta.y, input.modifiers.ctrl));
-            if scroll.abs() > 0.0 {
-                if let Some(pointer) = pointer {
-                    let (anchor_time, anchor_hz) = point_to_values(pointer);
-                    let factor = (1.0 - scroll * 0.0015).clamp(0.5, 2.0);
-                    if zoom_frequency {
-                        let new_freq_span = (freq_span * factor).clamp(100.0, nyquist);
-                        let freq_fraction = (plot.bottom() - pointer.y) / plot.height();
-                        let low = (anchor_hz - freq_fraction * new_freq_span)
-                            .clamp(0.0, (nyquist - new_freq_span).max(0.0));
-                        self.frequency_range = Some((low, low + new_freq_span));
-                    } else {
-                        let new_time_span = (time_span * factor).clamp(0.05, duration);
-                        let time_fraction = (pointer.x - plot.left()) / plot.width();
-                        let start = (anchor_time - time_fraction * new_time_span)
-                            .clamp(0.0, (duration - new_time_span).max(0.0));
-                        self.time_range = Some((start, start + new_time_span));
-                    }
-                }
-            }
-        }
-
-        let (secondary_pressed, secondary_down) = ui.input(|input| {
-            (
-                input.pointer.button_pressed(egui::PointerButton::Secondary),
-                input.pointer.button_down(egui::PointerButton::Secondary),
-            )
-        });
-        if secondary_pressed && pointer.is_some_and(|position| plot.contains(position)) {
+        if response.drag_started_by(egui::PointerButton::Primary) {
             if let Some(position) = pointer {
-                self.drag = Some(DragMode::Pan { last: position });
-            }
-        } else if response.drag_started_by(egui::PointerButton::Primary) {
-            if let Some(position) = pointer {
+                events.drag_started = true;
                 if playhead_in_view
                     && (position.x - playhead_raw_x).abs() <= PLAYHEAD_GRAB_X + PLAYHEAD_HIT_SLACK
                 {
@@ -406,17 +359,7 @@ impl SpectrogramView {
             }
         }
 
-        if secondary_down {
-            if let (Some(DragMode::Pan { last }), Some(position)) = (self.drag, pointer) {
-                let dt = -(position.x - last.x) / plot.width() * time_span;
-                let df = (position.y - last.y) / plot.height() * freq_span;
-                let new_start = (time_start + dt).clamp(0.0, (duration - time_span).max(0.0));
-                let new_low = (freq_low + df).clamp(0.0, (nyquist - freq_span).max(0.0));
-                self.time_range = Some((new_start, new_start + time_span));
-                self.frequency_range = Some((new_low, new_low + freq_span));
-                self.drag = Some(DragMode::Pan { last: position });
-            }
-        } else if response.dragged_by(egui::PointerButton::Primary) {
+        if response.dragged_by(egui::PointerButton::Primary) {
             if let Some(position) = pointer {
                 match self.drag {
                     Some(DragMode::Playhead) => events.seek_to = Some(point_to_values(position).0),
@@ -485,12 +428,8 @@ impl SpectrogramView {
             }
         }
 
-        let secondary_released = ui.input(|input| {
-            input
-                .pointer
-                .button_released(egui::PointerButton::Secondary)
-        });
-        if response.drag_stopped() || secondary_released {
+        if response.drag_stopped() {
+            events.drag_stopped = true;
             if let (Some(DragMode::Create(start)), Some(end)) = (self.drag, pointer) {
                 if (start.x - end.x).abs() > 4.0 && (start.y - end.y).abs() > 4.0 {
                     let (t1, f1) = point_to_values(start);
@@ -586,29 +525,38 @@ pub fn color_image(spectrogram: &Spectrogram) -> egui::ColorImage {
     let max_width = 8192usize;
     let width = spectrogram.n_time.min(max_width).max(1);
     let height = spectrogram.n_freq.max(1);
-    let mut pixels = Vec::with_capacity(width * height);
     let range = (spectrogram.db_max - spectrogram.db_min).max(1.0e-6);
-    for y in 0..height {
-        let frequency = height
-            .saturating_sub(1)
-            .saturating_sub(y)
-            .min(spectrogram.n_freq.saturating_sub(1));
-        for x in 0..width {
+    let time_ranges: Vec<(usize, usize)> = (0..width)
+        .map(|x| {
             let start = x * spectrogram.n_time / width;
             let end = ((x + 1) * spectrogram.n_time / width)
                 .max(start + 1)
                 .min(spectrogram.n_time);
-            let value = if start < end {
-                (start..end)
-                    .map(|time| spectrogram.at(frequency, time))
-                    .fold(f32::NEG_INFINITY, f32::max)
-            } else {
-                spectrogram.db_min
-            };
-            let normalized = ((value - spectrogram.db_min) / range).clamp(0.0, 1.0);
-            pixels.push(viridis(normalized));
-        }
-    }
+            (start, end)
+        })
+        .collect();
+    let mut pixels = vec![egui::Color32::BLACK; width * height];
+    pixels
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let frequency = height
+                .saturating_sub(1)
+                .saturating_sub(y)
+                .min(spectrogram.n_freq.saturating_sub(1));
+            for (x, pixel) in row.iter_mut().enumerate() {
+                let (start, end) = time_ranges[x];
+                let value = if start < end {
+                    (start..end)
+                        .map(|time| spectrogram.at(frequency, time))
+                        .fold(f32::NEG_INFINITY, f32::max)
+                } else {
+                    spectrogram.db_min
+                };
+                let normalized = ((value - spectrogram.db_min) / range).clamp(0.0, 1.0);
+                *pixel = viridis(normalized);
+            }
+        });
     egui::ColorImage::new([width, height], pixels)
 }
 

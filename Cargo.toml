@@ -10,4 +10,4 @@ rustfft = "6.4"
 rayon = "1.10"
 rodio = "0.21"
 hound = "3.5"
-symphonia = { version = "0.5", features = ["wav", "mp3", "flac", "ogg", "vorbis", "pcm"] }
+symphonia = { version = "0.5", features = ["wav", "mp3", "flac", "ogg", "vorbis", "pcm", "opt-simd"] }

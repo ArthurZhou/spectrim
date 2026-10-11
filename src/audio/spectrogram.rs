@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use rayon::prelude::*;
 use rustfft::num_complex::Complex32;
 use rustfft::FftPlanner;
@@ -5,8 +7,41 @@ use rustfft::FftPlanner;
 use super::types::{hann_window, AudioData, Spectrogram};
 
 pub fn compute(audio: &AudioData, n_fft: usize, hop: usize) -> Spectrogram {
+    let mono = mono_from_interleaved(&audio.samples, audio.channels);
+    compute_mono(mono.as_ref(), audio.sample_rate, n_fft, hop)
+}
+
+/// Compute the spectrogram of an interleaved PCM buffer without cloning it into
+/// an `AudioData`. Used for updating the edited-playback visualization.
+pub fn compute_interleaved(
+    samples: &[f32],
+    channels: u16,
+    sample_rate: u32,
+    n_fft: usize,
+    hop: usize,
+) -> Spectrogram {
+    let mono = mono_from_interleaved(samples, channels);
+    compute_mono(mono.as_ref(), sample_rate, n_fft, hop)
+}
+
+fn mono_from_interleaved(samples: &[f32], channels: u16) -> Cow<'_, [f32]> {
+    let channel_count = channels as usize;
+    if channel_count == 0 {
+        return Cow::Borrowed(&[]);
+    }
+    if channel_count == 1 {
+        return Cow::Borrowed(samples);
+    }
+    Cow::Owned(
+        samples
+            .par_chunks_exact(channel_count)
+            .map(|frame| frame.iter().sum::<f32>() / channel_count as f32)
+            .collect(),
+    )
+}
+
+fn compute_mono(mono: &[f32], sample_rate: u32, n_fft: usize, hop: usize) -> Spectrogram {
     let n_freq = n_fft / 2 + 1;
-    let mono = audio.to_mono();
     if n_fft == 0 || hop == 0 || mono.len() < n_fft {
         return Spectrogram {
             matrix: Vec::new(),
@@ -14,7 +49,7 @@ pub fn compute(audio: &AudioData, n_fft: usize, hop: usize) -> Spectrogram {
             n_time: 0,
             n_fft,
             hop_length: hop,
-            sample_rate: audio.sample_rate,
+            sample_rate,
             db_min: 0.0,
             db_max: 0.0,
         };
@@ -27,30 +62,33 @@ pub fn compute(audio: &AudioData, n_fft: usize, hop: usize) -> Spectrogram {
     let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(n_fft);
 
-    // Frames are fully independent, so the whole STFT is a parallel map. Each
-    // item yields one time frame's dB column; the scatter into the
-    // frequency-major matrix happens afterwards in a cheap sequential pass.
-    let columns: Vec<Vec<f32>> = (0..n_time)
-        .into_par_iter()
-        .map(|time| {
+    // Store results time-major first, so each Rayon worker writes a contiguous
+    // frame and no per-frame Vec allocations are needed. Transpose once into
+    // the frequency-major layout used by the UI/DSP contracts.
+    let mut time_major = vec![0.0f32; n_freq * n_time];
+    time_major.par_chunks_mut(n_freq).enumerate().for_each_init(
+        || vec![Complex32::default(); n_fft],
+        |frame, (time, output)| {
             let start = time * hop;
-            let mut frame = vec![Complex32::default(); n_fft];
             for index in 0..n_fft {
                 frame[index] = Complex32::new(mono[start + index] * window[index], 0.0);
             }
-            fft.process(&mut frame);
-            (0..n_freq)
-                .map(|frequency| 20.0 * (frame[frequency].norm() + 1.0e-9).log10())
-                .collect()
-        })
-        .collect();
+            fft.process(frame.as_mut_slice());
+            for (frequency, value) in output.iter_mut().enumerate() {
+                *value = 20.0 * (frame[frequency].norm() + 1.0e-9).log10();
+            }
+        },
+    );
 
     let mut matrix = vec![0.0f32; n_freq * n_time];
-    for (time, column) in columns.into_iter().enumerate() {
-        for (frequency, db) in column.into_iter().enumerate() {
-            matrix[frequency * n_time + time] = db;
-        }
-    }
+    matrix
+        .par_chunks_mut(n_time)
+        .enumerate()
+        .for_each(|(frequency, row)| {
+            for (time, value) in row.iter_mut().enumerate() {
+                *value = time_major[time * n_freq + frequency];
+            }
+        });
 
     let (db_min, db_max) = compute_db_range(&matrix);
     Spectrogram {
@@ -59,7 +97,7 @@ pub fn compute(audio: &AudioData, n_fft: usize, hop: usize) -> Spectrogram {
         n_time,
         n_fft,
         hop_length: hop,
-        sample_rate: audio.sample_rate,
+        sample_rate,
         db_min,
         db_max,
     }
@@ -130,11 +168,12 @@ fn compute_db_range(matrix: &[f32]) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn test_audio(frames: usize, sample_rate: u32) -> AudioData {
         AudioData {
             samples: (0..frames)
-                .map(|i| ((i as f32 * 0.01).sin() + (i as f32 * 0.13).cos() * 0.5))
+                .map(|i| (i as f32 * 0.01).sin() + (i as f32 * 0.13).cos() * 0.5)
                 .collect(),
             sample_rate,
             channels: 1,
@@ -206,14 +245,8 @@ mod tests {
         assert!(spec.db_min.is_finite() && spec.db_max.is_finite());
         assert!(spec.db_min < spec.db_max);
         // Percentiles must sit inside the true min/max.
-        let true_min = spec
-            .matrix
-            .iter()
-            .fold(f32::INFINITY, |a, b| a.min(*b));
-        let true_max = spec
-            .matrix
-            .iter()
-            .fold(f32::NEG_INFINITY, |a, b| a.max(*b));
+        let true_min = spec.matrix.iter().fold(f32::INFINITY, |a, b| a.min(*b));
+        let true_max = spec.matrix.iter().fold(f32::NEG_INFINITY, |a, b| a.max(*b));
         assert!(spec.db_min >= true_min - 1.0e-3);
         assert!(spec.db_max <= true_max + 1.0e-3);
         // 5th percentile should be above the true minimum for real audio.
@@ -226,5 +259,31 @@ mod tests {
         let spec = compute(&audio, 512, 128);
         assert_eq!(spec.n_time, 0);
         assert!(spec.matrix.is_empty());
+    }
+
+    #[test]
+    #[ignore = "manual three-minute STFT throughput check"]
+    fn benchmark_three_minute_mono_stft() {
+        let sample_rate = 44_100;
+        let frames = sample_rate as usize * 180;
+        let samples = (0..frames)
+            .map(|i| (i as f32 * 0.01).sin() * 0.5)
+            .collect::<Vec<_>>();
+        let audio = AudioData {
+            samples,
+            sample_rate,
+            channels: 1,
+            duration: 180.0,
+        };
+        let started = Instant::now();
+        let spec = compute(&audio, 2048, 512);
+        eprintln!(
+            "3-minute STFT: {:.2}s, {} Rayon workers, {}×{} matrix",
+            started.elapsed().as_secs_f32(),
+            rayon::current_num_threads(),
+            spec.n_freq,
+            spec.n_time
+        );
+        assert_eq!(spec.n_time, (frames - 2048) / 512 + 1);
     }
 }

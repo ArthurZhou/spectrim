@@ -40,7 +40,8 @@ pub fn apply_time_domain(audio: &AudioData, selections: &[Selection]) -> Vec<f32
     let sample_rate = audio.sample_rate.max(1) as f32;
 
     // Resolve seconds to frame bounds once instead of per frame per selection.
-    let resolved: Vec<ResolvedRegion> = selections.iter().map(|s| resolve(s, sample_rate)).collect();
+    let resolved: Vec<ResolvedRegion> =
+        selections.iter().map(|s| resolve(s, sample_rate)).collect();
 
     let frames = audio.frame_count();
     let mut output = audio.samples.clone();
@@ -126,7 +127,12 @@ fn frame_block(total: usize) -> usize {
 ///
 /// The estimate is corrected by evaluating the real predicate, so a boundary
 /// that lands exactly on a frame time behaves identically to before.
-fn active_frame_range(region: &ResolvedRegion, n_time: usize, hop: usize, sample_rate: f32) -> Option<(usize, usize)> {
+fn active_frame_range(
+    region: &ResolvedRegion,
+    n_time: usize,
+    hop: usize,
+    sample_rate: f32,
+) -> Option<(usize, usize)> {
     if n_time == 0 {
         return None;
     }
@@ -155,7 +161,12 @@ fn active_frame_range(region: &ResolvedRegion, n_time: usize, hop: usize, sample
 
 /// Inclusive bin range over which `region` applies, using the exact predicate
 /// `frequency >= freq_low && frequency <= freq_high`.
-fn active_bin_range(region: &ResolvedRegion, n_freq: usize, n_fft: usize, sample_rate: f32) -> Option<(usize, usize)> {
+fn active_bin_range(
+    region: &ResolvedRegion,
+    n_freq: usize,
+    n_fft: usize,
+    sample_rate: f32,
+) -> Option<(usize, usize)> {
     if region.full_band {
         return Some((0, n_freq - 1));
     }
@@ -247,127 +258,128 @@ pub fn apply_spectral_masks(
     let channel_buffers: Vec<Vec<f32>> = (0..channels)
         .into_par_iter()
         .map(|channel| {
-        let partials: Vec<(usize, Vec<f32>, Vec<f32>)> = (0..block_count)
-            .into_par_iter()
-            .map(|block_index| {
-                let frame_start = block_index * block;
-                let frame_end = (frame_start + block).min(n_time);
-                // Sample span this block writes into: the first frame's start
-                // through the last frame's start + n_fft.
-                let sample_start = frame_start * hop;
-                let sample_end = ((frame_end - 1) * hop + n_fft).min(input_frames);
-                let length = sample_end.saturating_sub(sample_start);
-                let mut accumulated = vec![0.0f32; length];
-                let mut weights = vec![0.0f32; length];
-                let mut spectrum = vec![Complex32::default(); n_fft];
-                let mut keep = vec![true; n_freq];
-                let mut gains = vec![1.0f32; n_freq];
+            let partials: Vec<(usize, Vec<f32>, Vec<f32>)> = (0..block_count)
+                .into_par_iter()
+                .map(|block_index| {
+                    let frame_start = block_index * block;
+                    let frame_end = (frame_start + block).min(n_time);
+                    // Sample span this block writes into: the first frame's start
+                    // through the last frame's start + n_fft.
+                    let sample_start = frame_start * hop;
+                    let sample_end = ((frame_end - 1) * hop + n_fft).min(input_frames);
+                    let length = sample_end.saturating_sub(sample_start);
+                    let mut accumulated = vec![0.0f32; length];
+                    let mut weights = vec![0.0f32; length];
+                    let mut spectrum = vec![Complex32::default(); n_fft];
+                    let mut keep = vec![true; n_freq];
+                    let mut gains = vec![1.0f32; n_freq];
 
-                for time_frame in frame_start..frame_end {
-                    let start = time_frame * hop;
-                    for index in 0..n_fft {
-                        let sample = audio.samples[(start + index) * channels + channel];
-                        spectrum[index] = Complex32::new(sample * window[index], 0.0);
-                    }
-                    forward.process(&mut spectrum);
-
-                    // Build this frame's mask from only the regions active here.
-                    for value in keep.iter_mut() {
-                        *value = !has_solo;
-                    }
-                    for value in gains.iter_mut() {
-                        *value = 1.0;
-                    }
-                    for region in mask_regions.iter() {
-                        if time_frame < region.frame_start || time_frame > region.frame_end {
-                            continue;
+                    for time_frame in frame_start..frame_end {
+                        let start = time_frame * hop;
+                        for index in 0..n_fft {
+                            let sample = audio.samples[(start + index) * channels + channel];
+                            spectrum[index] = Complex32::new(sample * window[index], 0.0);
                         }
-                        match region.action {
-                            SelectionAction::Solo => {
-                                if has_solo {
-                                    for slot in
-                                        keep[region.bin_start..=region.bin_end].iter_mut()
+                        forward.process(&mut spectrum);
+
+                        // Build this frame's mask from only the regions active here.
+                        for value in keep.iter_mut() {
+                            *value = !has_solo;
+                        }
+                        for value in gains.iter_mut() {
+                            *value = 1.0;
+                        }
+                        for region in mask_regions.iter() {
+                            if time_frame < region.frame_start || time_frame > region.frame_end {
+                                continue;
+                            }
+                            match region.action {
+                                SelectionAction::Solo => {
+                                    if has_solo {
+                                        for slot in
+                                            keep[region.bin_start..=region.bin_end].iter_mut()
+                                        {
+                                            *slot = true;
+                                        }
+                                    }
+                                }
+                                SelectionAction::Mute => {
+                                    if !has_solo {
+                                        for slot in
+                                            keep[region.bin_start..=region.bin_end].iter_mut()
+                                        {
+                                            *slot = false;
+                                        }
+                                    }
+                                }
+                                SelectionAction::Gain => {
+                                    for slot in gains[region.bin_start..=region.bin_end].iter_mut()
                                     {
-                                        *slot = true;
+                                        *slot *= region.gain;
                                     }
                                 }
                             }
-                            SelectionAction::Mute => {
-                                if !has_solo {
-                                    for slot in
-                                        keep[region.bin_start..=region.bin_end].iter_mut()
-                                    {
-                                        *slot = false;
-                                    }
+                        }
+
+                        for bin in 0..n_freq {
+                            if !keep[bin] {
+                                spectrum[bin] = Complex32::default();
+                                if bin > 0 && bin < n_fft / 2 {
+                                    spectrum[n_fft - bin] = Complex32::default();
+                                }
+                            } else if (gains[bin] - 1.0).abs() > 1.0e-9 {
+                                let gain = gains[bin];
+                                spectrum[bin] *= gain;
+                                if bin > 0 && bin < n_fft / 2 {
+                                    spectrum[n_fft - bin] *= gain;
                                 }
                             }
-                            SelectionAction::Gain => {
-                                for slot in gains[region.bin_start..=region.bin_end].iter_mut() {
-                                    *slot *= region.gain;
-                                }
+                        }
+
+                        inverse.process(&mut spectrum);
+                        let base = start - sample_start;
+                        for index in 0..n_fft {
+                            let slot = base + index;
+                            if slot < length {
+                                accumulated[slot] +=
+                                    spectrum[index].re / n_fft as f32 * window[index];
+                                weights[slot] += window[index] * window[index];
                             }
                         }
                     }
+                    (sample_start, accumulated, weights)
+                })
+                .collect();
 
-                    for bin in 0..n_freq {
-                        if !keep[bin] {
-                            spectrum[bin] = Complex32::default();
-                            if bin > 0 && bin < n_fft / 2 {
-                                spectrum[n_fft - bin] = Complex32::default();
-                            }
-                        } else if (gains[bin] - 1.0).abs() > 1.0e-9 {
-                            let gain = gains[bin];
-                            spectrum[bin] *= gain;
-                            if bin > 0 && bin < n_fft / 2 {
-                                spectrum[n_fft - bin] *= gain;
-                            }
-                        }
-                    }
-
-                    inverse.process(&mut spectrum);
-                    let base = start - sample_start;
-                    for index in 0..n_fft {
-                        let slot = base + index;
-                        if slot < length {
-                            accumulated[slot] +=
-                                spectrum[index].re / n_fft as f32 * window[index];
-                            weights[slot] += window[index] * window[index];
-                        }
+            // Merge the block-local overlap-add results. Sequential and linear in
+            // signal length, negligible next to the FFT work done above.
+            let mut accumulated = vec![0.0f32; input_frames];
+            let mut weights = vec![0.0f32; input_frames];
+            for (sample_start, local_accumulated, local_weights) in partials {
+                for (offset, value) in local_accumulated.into_iter().enumerate() {
+                    let index = sample_start + offset;
+                    if index < input_frames {
+                        accumulated[index] += value;
                     }
                 }
-                (sample_start, accumulated, weights)
-            })
-            .collect();
-
-        // Merge the block-local overlap-add results. Sequential and linear in
-        // signal length, negligible next to the FFT work done above.
-        let mut accumulated = vec![0.0f32; input_frames];
-        let mut weights = vec![0.0f32; input_frames];
-        for (sample_start, local_accumulated, local_weights) in partials {
-            for (offset, value) in local_accumulated.into_iter().enumerate() {
-                let index = sample_start + offset;
-                if index < input_frames {
-                    accumulated[index] += value;
+                for (offset, value) in local_weights.into_iter().enumerate() {
+                    let index = sample_start + offset;
+                    if index < input_frames {
+                        weights[index] += value;
+                    }
                 }
             }
-            for (offset, value) in local_weights.into_iter().enumerate() {
-                let index = sample_start + offset;
-                if index < input_frames {
-                    weights[index] += value;
-                }
-            }
-        }
 
-        (0..input_frames)
-            .map(|index| {
-                if weights[index] > 1.0e-8 {
-                    accumulated[index] / weights[index]
-                } else {
-                    0.0
-                }
-            })
-            .collect()
-    })
+            (0..input_frames)
+                .map(|index| {
+                    if weights[index] > 1.0e-8 {
+                        accumulated[index] / weights[index]
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        })
         .collect();
 
     // Re-interleave the per-channel results into the output buffer.
@@ -449,9 +461,7 @@ mod tests {
         let n_freq = n_fft / 2 + 1;
         let n_time = (input_frames - n_fft) / hop + 1;
         let window = hann_window(n_fft);
-        let has_solo = selections
-            .iter()
-            .any(|s| s.action == SelectionAction::Solo);
+        let has_solo = selections.iter().any(|s| s.action == SelectionAction::Solo);
         let mut planner = FftPlanner::<f32>::new();
         let forward = planner.plan_fft_forward(n_fft);
         let inverse = planner.plan_fft_inverse(n_fft);
@@ -508,8 +518,7 @@ mod tests {
                 inverse.process(&mut spectrum);
                 for index in 0..n_fft {
                     let sample_index = start + index;
-                    accumulated[sample_index] +=
-                        spectrum[index].re / n_fft as f32 * window[index];
+                    accumulated[sample_index] += spectrum[index].re / n_fft as f32 * window[index];
                     window_weights[sample_index] += window[index] * window[index];
                 }
             }
@@ -529,7 +538,9 @@ mod tests {
         let mut state = 12345u64;
         let samples: Vec<f32> = (0..frames * channels as usize)
             .map(|i| {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let noise = ((state >> 33) as f32 / (1u64 << 31) as f32) * 0.2 - 0.1;
                 let t = (i / channels as usize) as f32 / sample_rate as f32;
                 noise
@@ -631,7 +642,10 @@ mod tests {
             .zip(want.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert!(max_err < 1.0e-5, "out-of-range region changed output: {max_err}");
+        assert!(
+            max_err < 1.0e-5,
+            "out-of-range region changed output: {max_err}"
+        );
     }
 
     #[test]
