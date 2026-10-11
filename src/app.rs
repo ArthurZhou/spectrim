@@ -10,7 +10,7 @@ use crate::audio::decode::decode_file;
 use crate::audio::export::export_wav;
 use crate::audio::preview::{PreviewCache, PreviewOutcome};
 use crate::audio::process::apply_selections;
-use crate::audio::spectrogram;
+use crate::audio::spectrogram::{self, SpectrogramPatch};
 use crate::audio::types::{AudioData, Selection, SelectionAction, Spectrogram};
 use crate::playback::PlaybackHandle;
 use crate::ui::spectrogram_view::SpectrogramView;
@@ -49,12 +49,32 @@ enum WorkerJob {
     Preview {
         audio: Arc<AudioData>,
         selections: Vec<Selection>,
+        revision: u64,
     },
     /// Exact STFT render for writing a WAV file.
     Export {
         audio: Arc<AudioData>,
         selections: Vec<Selection>,
         path: PathBuf,
+    },
+}
+
+/// FFT refresh jobs use a separate worker so the latency-sensitive IIR preview
+/// thread can immediately process the next edit instead of waiting on FFT.
+enum SpectrogramJob {
+    PatchFromPcm {
+        samples: Arc<Vec<f32>>,
+        channels: u16,
+        sample_rate: u32,
+        changed_frames: (usize, usize),
+        n_total_time: usize,
+        revision: u64,
+    },
+    FullRebuild {
+        samples: Arc<Vec<f32>>,
+        channels: u16,
+        sample_rate: u32,
+        revision: u64,
     },
 }
 
@@ -65,8 +85,10 @@ enum WorkerMessage {
         samples: Arc<Vec<f32>>,
         changed_frames: Option<(usize, usize)>,
         full_rebuild: bool,
-        spectrogram: Spectrogram,
+        revision: u64,
     },
+    SpectrogramDone(Option<(u64, usize, SpectrogramPatch)>),
+    SpectrogramRebuilt(u64, Spectrogram),
     ExportDone(Result<(), String>),
 }
 
@@ -77,8 +99,11 @@ pub struct SpectrimApp {
     load_started: Option<Instant>,
     /// Sender end of the persistent worker; `None` when no worker is running.
     worker_sender: Option<mpsc::Sender<WorkerJob>>,
+    spectrogram_sender: Option<mpsc::Sender<SpectrogramJob>>,
     worker_receiver: Option<Receiver<WorkerMessage>>,
     worker_busy: bool,
+    pending_spectrograms: usize,
+    preview_revision: u64,
     /// True while an export is in flight (preview results must not disturb it).
     export_in_flight: bool,
     playback: PlaybackHandle,
@@ -112,8 +137,11 @@ impl Default for SpectrimApp {
             load_receiver: None,
             load_started: None,
             worker_sender: None,
+            spectrogram_sender: None,
             worker_receiver: None,
             worker_busy: false,
+            pending_spectrograms: 0,
+            preview_revision: 0,
             export_in_flight: false,
             playback: PlaybackHandle::spawn(),
             is_playing: false,
@@ -191,32 +219,107 @@ impl SpectrimApp {
             return;
         }
         let (job_tx, job_rx) = mpsc::channel::<WorkerJob>();
+        let (spectrogram_tx, spectrogram_rx) = mpsc::channel::<SpectrogramJob>();
         let (msg_tx, msg_rx) = mpsc::channel::<WorkerMessage>();
         let mut cache = PreviewCache::new();
         self.worker_sender = Some(job_tx);
+        self.spectrogram_sender = Some(spectrogram_tx.clone());
         self.worker_receiver = Some(msg_rx);
         // Move the existing cache into the worker so a reload is not needed.
         std::mem::swap(&mut cache, &mut self.preview_cache);
+        let spectrogram_msg_tx = msg_tx.clone();
+        thread::spawn(move || {
+            while let Ok(job) = spectrogram_rx.recv() {
+                match job {
+                    SpectrogramJob::PatchFromPcm {
+                        samples,
+                        channels,
+                        sample_rate,
+                        changed_frames,
+                        n_total_time,
+                        revision,
+                    } => {
+                        let patch = spectrogram::compute_interleaved_patch(
+                            &samples,
+                            channels,
+                            sample_rate,
+                            2048,
+                            512,
+                            changed_frames.0,
+                            changed_frames.1,
+                        );
+                        let texture_width = n_total_time.min(8192);
+                        let first_x = patch.first_time_frame * texture_width / n_total_time.max(1);
+                        let _ = spectrogram_msg_tx.send(WorkerMessage::SpectrogramDone(Some((
+                            revision, first_x, patch,
+                        ))));
+                    }
+                    SpectrogramJob::FullRebuild {
+                        samples,
+                        channels,
+                        sample_rate,
+                        revision,
+                    } => {
+                        let full = spectrogram::compute_interleaved(
+                            &samples,
+                            channels,
+                            sample_rate,
+                            2048,
+                            512,
+                        );
+                        let _ = spectrogram_msg_tx
+                            .send(WorkerMessage::SpectrogramRebuilt(revision, full));
+                    }
+                }
+            }
+        });
         thread::spawn(move || {
             let mut cache = cache;
             while let Ok(job) = job_rx.recv() {
                 match job {
-                    WorkerJob::Preview { audio, selections } => {
+                    WorkerJob::Preview {
+                        audio,
+                        selections,
+                        revision,
+                    } => {
                         let outcome: PreviewOutcome = cache.render(&audio, &selections);
-                        let samples = Arc::new(cache.samples.clone());
-                        let spectrogram = spectrogram::compute_interleaved(
-                            &samples,
-                            audio.channels,
-                            audio.sample_rate,
-                            2048,
-                            512,
-                        );
+                        // Publish audible IIR output first. FFT work is queued
+                        // to its own worker and cannot delay preview/playback.
                         let _ = msg_tx.send(WorkerMessage::PreviewDone {
-                            samples,
+                            samples: Arc::new(cache.samples.clone()),
                             changed_frames: outcome.changed_frames,
                             full_rebuild: outcome.full_rebuild,
-                            spectrogram,
+                            revision,
                         });
+                        if let Some(changed_frames) = outcome.changed_frames {
+                            let total_frames = audio.frame_count();
+                            let n_time = total_frames.saturating_sub(2048) / 512 + 1;
+                            if outcome.full_rebuild {
+                                let _ = spectrogram_tx.send(SpectrogramJob::FullRebuild {
+                                    samples: Arc::new(cache.samples.clone()),
+                                    channels: audio.channels,
+                                    sample_rate: audio.sample_rate,
+                                    revision,
+                                });
+                            } else {
+                                let expanded = spectrogram::expanded_patch_frames(
+                                    changed_frames,
+                                    n_time,
+                                    total_frames,
+                                    2048,
+                                    512,
+                                    8192,
+                                );
+                                let _ = spectrogram_tx.send(SpectrogramJob::PatchFromPcm {
+                                    samples: Arc::new(cache.samples.clone()),
+                                    channels: audio.channels,
+                                    sample_rate: audio.sample_rate,
+                                    changed_frames: expanded,
+                                    n_total_time: n_time,
+                                    revision,
+                                });
+                            }
+                        }
                     }
                     WorkerJob::Export {
                         audio,
@@ -236,8 +339,11 @@ impl SpectrimApp {
 
     fn stop_worker(&mut self) {
         self.worker_sender = None;
+        self.spectrogram_sender = None;
         self.worker_receiver = None;
         self.worker_busy = false;
+        self.pending_spectrograms = 0;
+        self.preview_revision = self.preview_revision.wrapping_add(1);
         self.export_in_flight = false;
     }
 
@@ -257,8 +363,14 @@ impl SpectrimApp {
             return;
         };
         let selections = self.selections.clone();
+        self.preview_revision = self.preview_revision.wrapping_add(1);
+        let revision = self.preview_revision;
         self.preview_dirty = true;
-        let _ = sender.send(WorkerJob::Preview { audio, selections });
+        let _ = sender.send(WorkerJob::Preview {
+            audio,
+            selections,
+            revision,
+        });
     }
 
     fn poll_workers(&mut self, ctx: &egui::Context) {
@@ -310,14 +422,12 @@ impl SpectrimApp {
                 samples,
                 changed_frames,
                 full_rebuild,
-                spectrogram: edited_spectrogram,
+                revision,
             }) => {
                 self.preview_dirty = false;
                 self.preview_samples = Some(Arc::clone(&samples));
-                if let Some(loaded) = &mut self.loaded {
-                    let image = crate::ui::spectrogram_view::color_image(&edited_spectrogram);
-                    loaded.texture.set(image, egui::TextureOptions::LINEAR);
-                    loaded.spectrogram = edited_spectrogram;
+                if revision == self.preview_revision {
+                    self.pending_spectrograms += usize::from(changed_frames.is_some());
                 }
 
                 // Playback continuity: if we are playing in edited mode, hand the
@@ -333,6 +443,55 @@ impl SpectrimApp {
                     self.status = "Preview updated.".to_owned();
                 }
             }
+            Some(WorkerMessage::SpectrogramDone(Some((revision, first_x, patch)))) => {
+                self.pending_spectrograms = self.pending_spectrograms.saturating_sub(1);
+                if revision == self.preview_revision {
+                    if let Some(loaded) = &mut self.loaded {
+                        if patch.n_freq == loaded.spectrogram.n_freq
+                            && patch.first_time_frame + patch.n_time <= loaded.spectrogram.n_time
+                        {
+                            for frequency in 0..patch.n_freq {
+                                let src = &patch.matrix
+                                    [frequency * patch.n_time..(frequency + 1) * patch.n_time];
+                                let start =
+                                    frequency * loaded.spectrogram.n_time + patch.first_time_frame;
+                                loaded.spectrogram.matrix[start..start + patch.n_time]
+                                    .copy_from_slice(src);
+                            }
+                            if let Some((x, image)) = crate::ui::spectrogram_view::color_image_patch(
+                                &patch,
+                                loaded.spectrogram.n_time,
+                                loaded.spectrogram.db_min,
+                                loaded.spectrogram.db_max,
+                            ) {
+                                loaded.texture.set_partial(
+                                    [x.max(first_x), 0],
+                                    image,
+                                    egui::TextureOptions::LINEAR,
+                                );
+                            }
+                        }
+                    }
+                }
+                self.status = "Preview and changed FFT columns updated.".to_owned();
+            }
+            Some(WorkerMessage::SpectrogramDone(None)) => {
+                self.pending_spectrograms = self.pending_spectrograms.saturating_sub(1);
+            }
+            Some(WorkerMessage::SpectrogramRebuilt(revision, rebuilt)) => {
+                self.pending_spectrograms = self.pending_spectrograms.saturating_sub(1);
+                if revision == self.preview_revision {
+                    if let Some(loaded) = &mut self.loaded {
+                        if rebuilt.n_freq == loaded.spectrogram.n_freq
+                            && rebuilt.n_time == loaded.spectrogram.n_time
+                        {
+                            let image = crate::ui::spectrogram_view::color_image(&rebuilt);
+                            loaded.texture.set(image, egui::TextureOptions::LINEAR);
+                            loaded.spectrogram = rebuilt;
+                        }
+                    }
+                }
+            }
             Some(WorkerMessage::ExportDone(result)) => {
                 self.export_in_flight = false;
                 self.worker_busy = false;
@@ -344,7 +503,10 @@ impl SpectrimApp {
             None => {}
         }
 
-        if self.load_receiver.is_some() || self.worker_receiver.is_some() {
+        if self.load_receiver.is_some()
+            || self.worker_receiver.is_some()
+            || self.pending_spectrograms > 0
+        {
             ctx.request_repaint_after(Duration::from_millis(30));
         }
         if self.load_started.is_some() {
@@ -493,7 +655,8 @@ impl eframe::App for SpectrimApp {
         self.poll_workers(ctx);
         self.flush_preview_debounce(ctx);
 
-        let processing = self.export_in_flight || self.preview_dirty;
+        let processing =
+            self.export_in_flight || self.preview_dirty || self.pending_spectrograms > 0;
         let duration = self
             .loaded
             .as_ref()

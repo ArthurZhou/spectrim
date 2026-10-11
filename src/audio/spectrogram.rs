@@ -24,6 +24,151 @@ pub fn compute_interleaved(
     compute_mono(mono.as_ref(), sample_rate, n_fft, hop)
 }
 
+/// A frequency-major patch of spectrogram columns changed by a PCM frame span.
+#[derive(Debug)]
+pub struct SpectrogramPatch {
+    pub first_time_frame: usize,
+    pub n_time: usize,
+    pub n_freq: usize,
+    pub matrix: Vec<f32>,
+}
+
+/// Source-frame span which must be invalidated so patch FFT windows cover every
+/// changed PCM sample, while expanding to whole display columns when texture
+/// generation uses time downsampling.
+pub fn expanded_patch_frames(
+    changed_frames: (usize, usize),
+    n_total_time: usize,
+    total_pcm_frames: usize,
+    n_fft: usize,
+    hop: usize,
+    max_texture_width: usize,
+) -> (usize, usize) {
+    if n_total_time == 0 || total_pcm_frames == 0 || n_fft == 0 || hop == 0 {
+        return changed_frames;
+    }
+    let width = n_total_time.min(max_texture_width.max(1));
+    let mut first_fft = if changed_frames.0 < n_fft {
+        0
+    } else {
+        (changed_frames.0 - n_fft) / hop + 1
+    }
+    .min(n_total_time);
+    let mut last_fft = changed_frames.1.saturating_sub(1) / hop + 1;
+    if last_fft <= first_fft {
+        return changed_frames;
+    }
+
+    // Expand to exactly the display columns intersected by the changed FFT
+    // frames; egui patches can then replace full columns without stale pixels.
+    let first_x = first_fft * width / n_total_time;
+    let last_x_exclusive = (last_fft * width).div_ceil(n_total_time).min(width);
+    first_fft = first_x * n_total_time / width;
+    last_fft = (last_x_exclusive * n_total_time)
+        .div_ceil(width)
+        .min(n_total_time);
+    let pcm_start = first_fft.saturating_mul(hop);
+    let pcm_end = last_fft
+        .saturating_sub(1)
+        .saturating_mul(hop)
+        .saturating_add(n_fft)
+        .min(total_pcm_frames);
+    (pcm_start, pcm_end.max(pcm_start))
+}
+
+/// Recompute only STFT windows intersecting the changed PCM frame range
+/// `[changed_start, changed_end)`. Frame values retain the full spectrogram's
+/// global dB normalization; callers can splice this patch into the cached matrix.
+pub fn compute_interleaved_patch(
+    samples: &[f32],
+    channels: u16,
+    _sample_rate: u32,
+    n_fft: usize,
+    hop: usize,
+    changed_start: usize,
+    changed_end: usize,
+) -> SpectrogramPatch {
+    let channel_count = channels as usize;
+    let n_freq = n_fft / 2 + 1;
+    let total_frames = if channel_count == 0 {
+        0
+    } else {
+        samples.len() / channel_count
+    };
+    let start = changed_start.min(total_frames);
+    let end = changed_end.min(total_frames);
+    if channel_count == 0 || n_fft == 0 || hop == 0 || end <= start || total_frames < n_fft {
+        return SpectrogramPatch {
+            first_time_frame: 0,
+            n_time: 0,
+            n_freq,
+            matrix: Vec::new(),
+        };
+    }
+
+    let total_time = (total_frames - n_fft) / hop + 1;
+    // A window beginning before `end` and ending after `start` overlaps the
+    // changed samples. The half-open ranges avoid recomputing adjacent columns.
+    let first = if start < n_fft {
+        0
+    } else {
+        (start - n_fft) / hop + 1
+    }
+    .min(total_time);
+    let last_exclusive = ((end - 1) / hop + 1).min(total_time);
+    if last_exclusive <= first {
+        return SpectrogramPatch {
+            first_time_frame: first,
+            n_time: 0,
+            n_freq,
+            matrix: Vec::new(),
+        };
+    }
+
+    let window = hann_window(n_fft);
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(n_fft);
+    let patch_time = last_exclusive - first;
+    let mut time_major = vec![0.0f32; n_freq * patch_time];
+    time_major.par_chunks_mut(n_freq).enumerate().for_each_init(
+        || vec![Complex32::default(); n_fft],
+        |spectrum, (local_time, output)| {
+            let pcm_start = (first + local_time) * hop;
+            for i in 0..n_fft {
+                let frame =
+                    &samples[(pcm_start + i) * channel_count..(pcm_start + i + 1) * channel_count];
+                let mono = frame.iter().sum::<f32>() / channel_count as f32;
+                spectrum[i] = Complex32::new(mono * window[i], 0.0);
+            }
+            fft.process(spectrum.as_mut_slice());
+            for (frequency, value) in output.iter_mut().enumerate() {
+                let magnitude = spectrum[frequency].norm();
+                *value = if magnitude <= 1.0e-10 {
+                    f32::NEG_INFINITY
+                } else {
+                    20.0 * magnitude.log10()
+                };
+            }
+        },
+    );
+    let mut matrix = vec![0.0f32; n_freq * patch_time];
+    matrix
+        .par_chunks_mut(patch_time)
+        .enumerate()
+        .for_each(|(frequency, row)| {
+            for (time, value) in row.iter_mut().enumerate() {
+                *value = time_major[time * n_freq + frequency];
+            }
+        });
+
+    SpectrogramPatch {
+        first_time_frame: first,
+        n_time: patch_time,
+        n_freq,
+        matrix,
+    }
+}
+
 fn mono_from_interleaved(samples: &[f32], channels: u16) -> Cow<'_, [f32]> {
     let channel_count = channels as usize;
     if channel_count == 0 {
@@ -75,7 +220,12 @@ fn compute_mono(mono: &[f32], sample_rate: u32, n_fft: usize, hop: usize) -> Spe
             }
             fft.process(frame.as_mut_slice());
             for (frequency, value) in output.iter_mut().enumerate() {
-                *value = 20.0 * (frame[frequency].norm() + 1.0e-9).log10();
+                let magnitude = frame[frequency].norm();
+                *value = if magnitude <= 1.0e-10 {
+                    f32::NEG_INFINITY
+                } else {
+                    20.0 * magnitude.log10()
+                };
             }
         },
     );
@@ -126,19 +276,31 @@ fn compute_db_range(matrix: &[f32]) -> (f32, f32) {
             || (f32::INFINITY, f32::NEG_INFINITY),
             |(a_lo, a_hi), (b_lo, b_hi)| (a_lo.min(b_lo), a_hi.max(b_hi)),
         );
-    let span = max - min;
-    if !span.is_finite() || span < 1.0e-6 {
-        return (min, max);
+    let mut histogram_min = min;
+    let mut histogram_max = max;
+    if histogram_min == f32::NEG_INFINITY {
+        histogram_min = -180.0;
     }
-
-    let scale = (BINS - 1) as f32 / span;
+    if !histogram_max.is_finite() {
+        histogram_max = 0.0;
+    }
+    let range = histogram_max - histogram_min;
+    if !range.is_finite() || range < 1.0e-6 {
+        return (histogram_min, histogram_max);
+    }
+    let scale = (BINS - 1) as f32 / range;
     let chunk = (matrix.len() / (rayon::current_num_threads() * 4).max(1) + 1).max(1);
     let total: Vec<u64> = matrix
         .par_chunks(chunk)
         .map(|chunk| {
             let mut histogram = vec![0u64; BINS];
             for value in chunk {
-                let bin = (((value - min) * scale).round() as usize).min(BINS - 1);
+                let finite_value = if value.is_finite() {
+                    *value
+                } else {
+                    histogram_min
+                };
+                let bin = (((finite_value - histogram_min) * scale).round() as usize).min(BINS - 1);
                 histogram[bin] += 1;
             }
             histogram
@@ -157,10 +319,10 @@ fn compute_db_range(matrix: &[f32]) -> (f32, f32) {
         for (bin, count) in total.iter().enumerate() {
             cumulative += count;
             if cumulative > target {
-                return min + bin as f32 / scale;
+                return histogram_min + bin as f32 / scale;
             }
         }
-        max
+        histogram_max
     };
     (percentile(0.05), percentile(0.95))
 }
@@ -231,7 +393,12 @@ mod tests {
             }
             fft.process(&mut frame);
             for frequency in 0..n_freq {
-                let db = 20.0 * (frame[frequency].norm() + 1.0e-9).log10();
+                let magnitude = frame[frequency].norm();
+                let db = if magnitude <= 1.0e-10 {
+                    f32::NEG_INFINITY
+                } else {
+                    20.0 * magnitude.log10()
+                };
                 max_err = max_err.max((db - spec.at(frequency, time)).abs());
             }
         }
@@ -259,6 +426,58 @@ mod tests {
         let spec = compute(&audio, 512, 128);
         assert_eq!(spec.n_time, 0);
         assert!(spec.matrix.is_empty());
+    }
+
+    #[test]
+    fn incremental_patch_matches_columns_from_full_transform() {
+        let channels = 2;
+        let rate = 8_000;
+        let frames = 4096;
+        let samples: Vec<f32> = (0..frames * channels)
+            .map(|i| (i as f32 * 0.071).sin() * 0.4)
+            .collect();
+        let full = compute_interleaved(&samples, channels as u16, rate, 256, 64);
+        let patch = compute_interleaved_patch(&samples, channels as u16, rate, 256, 64, 700, 1200);
+        assert!(patch.n_time > 0);
+        for frequency in 0..patch.n_freq {
+            for local_time in 0..patch.n_time {
+                let expected = full.at(frequency, patch.first_time_frame + local_time);
+                let actual = patch.matrix[frequency * patch.n_time + local_time];
+                if expected.is_infinite() {
+                    assert_eq!(actual, expected);
+                } else {
+                    assert!((actual - expected).abs() < 1.0e-4);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_silence_is_negative_infinity_db() {
+        let audio = AudioData {
+            samples: vec![0.0; 4096],
+            sample_rate: 44_100,
+            channels: 1,
+            duration: 4096.0 / 44_100.0,
+        };
+        let spec = compute(&audio, 256, 64);
+        assert!(spec.matrix.iter().all(|value| *value == f32::NEG_INFINITY));
+        assert!(spec.db_min.is_finite());
+        assert!(spec.db_max.is_finite());
+    }
+
+    #[test]
+    fn expanded_frame_span_covers_overlapping_fft_windows() {
+        let changed = (5000, 6000);
+        let expanded = expanded_patch_frames(changed, 100, 52_736, 2048, 512, 8192);
+        let first_fft = if expanded.0 < 2048 {
+            0
+        } else {
+            (expanded.0 - 2048) / 512 + 1
+        };
+        let last_fft = (expanded.1 - 1) / 512 + 1;
+        assert!(first_fft * 512 < changed.0);
+        assert!((last_fft - 1) * 512 + 2048 >= changed.1);
     }
 
     #[test]
