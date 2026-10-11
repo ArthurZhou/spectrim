@@ -156,7 +156,7 @@ impl Default for SpectrimApp {
             selections: Vec::new(),
             selected_selection: None,
             next_selection_id: 1,
-            default_action: SelectionAction::Mute,
+            default_action: SelectionAction::Gain,
             spectrogram_view: SpectrogramView::default(),
         }
     }
@@ -442,6 +442,9 @@ impl SpectrimApp {
                 } else {
                     self.status = "Preview updated.".to_owned();
                 }
+                if revision == self.preview_revision && full_rebuild && changed_frames.is_some() {
+                    self.pending_spectrograms += 1;
+                }
             }
             Some(WorkerMessage::SpectrogramDone(Some((revision, first_x, patch)))) => {
                 self.pending_spectrograms = self.pending_spectrograms.saturating_sub(1);
@@ -618,6 +621,33 @@ impl SpectrimApp {
         });
     }
 
+    fn request_full_fft(&mut self) {
+        let Some((channels, sample_rate, dry)) = self.loaded.as_ref().map(|loaded| {
+            (
+                loaded.audio.channels,
+                loaded.audio.sample_rate,
+                Arc::clone(&loaded.dry_samples),
+            )
+        }) else {
+            return;
+        };
+        let samples = self.preview_samples.clone().unwrap_or(dry);
+        self.start_worker();
+        let Some(sender) = self.spectrogram_sender.clone() else {
+            return;
+        };
+        self.preview_revision = self.preview_revision.wrapping_add(1);
+        let revision = self.preview_revision;
+        self.pending_spectrograms += 1;
+        self.status = "Recalculating FFT…".to_owned();
+        let _ = sender.send(SpectrogramJob::FullRebuild {
+            samples,
+            channels,
+            sample_rate,
+            revision,
+        });
+    }
+
     /// An edit happened. Unlike the original, this does **not** stop playback and
     /// does **not** reset the playhead; it schedules a debounced incremental
     /// preview render and lets the mixer swap buffers underneath.
@@ -703,9 +733,18 @@ impl eframe::App for SpectrimApp {
                 }
                 ui.separator();
                 ui.label("New selection:");
-                ui.selectable_value(&mut self.default_action, SelectionAction::Mute, "Mute");
-                ui.selectable_value(&mut self.default_action, SelectionAction::Solo, "Solo");
+                ui.selectable_value(&mut self.default_action, SelectionAction::Solo, "Solo")
+                    .on_hover_text("Solo regions are combined as a union; while any Solo exists, Gain regions are ignored.");
                 ui.selectable_value(&mut self.default_action, SelectionAction::Gain, "Gain");
+                if ui
+                    .add_enabled(
+                        self.loaded.is_some() && !self.preview_dirty && !self.export_in_flight,
+                        egui::Button::new("Recalculate FFT"),
+                    )
+                    .clicked()
+                {
+                    self.request_full_fft();
+                }
                 if ui
                     .add_enabled(
                         self.loaded.is_some() && !self.export_in_flight,

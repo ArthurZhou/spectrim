@@ -11,17 +11,20 @@
 //! in.
 //!
 //! Two design points make the increment possible:
-//!   1. A full-band region (mute / solo / whole-band gain) is a pure time-domain
-//!      multiply, so it can be re-evaluated for any frame range in isolation.
+//!   1. A full-band region (solo / whole-band gain, including zero gain) is a
+//!      pure time-domain multiply, so it can be re-evaluated for any frame range
+//!      in isolation.
 //!   2. A frequency-selective region only needs the *dry* audio filtered into
 //!      its band; the band signal for the whole track is cached per region id,
 //!      so moving a region's time window never re-runs the IIR filter.
 //!
 //! Preview semantics for frequency-selective regions are an approximation of
 //! the export path: the band is extracted with a 4th-order Butterworth pair
-//! instead of brick-wall FFT bins. Mute subtracts the band, Gain adds
-//! `band * (gain - 1)`, Solo replaces the output with the band inside the
-//! region's time window. Export stays exact.
+//! instead of brick-wall FFT bins. Zero gain subtracts the band, other Gain
+//! values add `band * (gain - 1)`, and Solo replaces the output with the band
+//! inside its region. Any Solo region takes precedence over outside-region
+//! Gain regions: output is silent outside the union of Solo regions. Export
+//! stays exact.
 
 use rayon::prelude::*;
 
@@ -105,8 +108,8 @@ fn resolve_time(selection: &Selection, sample_rate: f32) -> (usize, usize) {
     )
 }
 
-/// Per-frame full-band factor: `None` means the frame is silenced (muted, or
-/// outside every solo region when a full-band solo exists), otherwise it is the
+/// Per-frame full-band factor: `None` means the frame is outside every solo
+/// region when a full-band solo exists; otherwise it is the
 /// cumulative gain multiplier.
 ///
 /// `ignore_solo` is used for the band-solo path, where full-band solo gating
@@ -119,12 +122,10 @@ fn full_band_factor(
 ) -> Option<f32> {
     let mut gain = 1.0f32;
     let mut in_solo = false;
-    let mut in_mute = false;
     for r in resolved {
         let inside = frame_index >= r.start && frame_index < r.end;
         match r.action {
             SelectionAction::Solo => in_solo |= inside,
-            SelectionAction::Mute => in_mute |= inside,
             SelectionAction::Gain => {
                 if inside {
                     gain *= r.gain;
@@ -133,19 +134,13 @@ fn full_band_factor(
         }
     }
     if ignore_solo {
-        if in_mute {
-            None
-        } else {
-            Some(gain)
-        }
+        Some(gain)
     } else if has_solo {
         if in_solo {
-            Some(gain)
+            Some(1.0)
         } else {
             None
         }
-    } else if in_mute {
-        None
     } else {
         Some(gain)
     }
@@ -266,9 +261,7 @@ fn render_range(
         return Vec::new();
     }
 
-    // Full-band regions only — band regions are layered on top below, and must
-    // NOT also be applied as time-domain mutes (that was a double-attenuation
-    // bug: a band mute would silence the whole window before subtracting).
+    // Full-band regions only — band regions are layered on top below.
     let full_band: Vec<Selection> = selections.iter().filter(|s| s.full_band).cloned().collect();
     let mut output = render_time_domain(audio, &full_band, start_frame, end_frame);
 
@@ -301,31 +294,14 @@ fn render_range(
     if band_regions.is_empty() {
         return output;
     }
-    let has_band_solo = band_regions
+    let has_solo = selections
         .iter()
-        .any(|r| r.action == SelectionAction::Solo);
-
-    // For the band-solo path we need full-band mute/gain factors without solo
-    // gating (the band solo itself decides what is audible).
-    let resolved_all: Vec<Resolved> = selections
+        .any(|selection| selection.action == SelectionAction::Solo);
+    let full_band_solos: Vec<_> = selections
         .iter()
-        .filter(|s| s.full_band)
-        .map(|s| {
-            let (start, end) = resolve_time(s, sample_rate);
-            Resolved {
-                action: s.action,
-                start,
-                end,
-                gain: s.gain.clamp(0.0, 4.0),
-            }
-        })
+        .filter(|selection| selection.full_band && selection.action == SelectionAction::Solo)
+        .map(|selection| resolve_time(selection, sample_rate))
         .collect();
-
-    let dry = if has_band_solo {
-        deinterleave(audio)
-    } else {
-        Vec::new()
-    };
 
     let block = block_size(span, channels);
     output
@@ -334,42 +310,35 @@ fn render_range(
         .for_each(|(block_index, chunk)| {
             let mut frame_index = start_frame + (block_index * block) / channels;
             for frame in chunk.chunks_exact_mut(channels) {
-                if has_band_solo {
-                    // Output is only the soloed band(s) inside their windows;
-                    // everything else is silent. Full-band mute/gain still apply.
-                    let factor =
-                        full_band_factor(&resolved_all, false, frame_index, true).unwrap_or(0.0);
-                    for c in 0..channels {
-                        let mut value = 0.0f32;
+                if has_solo {
+                    // Solo regions form a union across full-band and band
+                    // regions. Gain regions are ignored while any Solo exists.
+                    let mut in_any_solo = false;
+                    frame.fill(0.0);
+                    let full_band_solo_active = full_band_solos
+                        .iter()
+                        .any(|(start, end)| frame_index >= *start && frame_index < *end);
+                    if full_band_solo_active {
+                        for (channel, value) in frame.iter_mut().enumerate() {
+                            *value = audio.samples[frame_index * channels + channel];
+                        }
+                        in_any_solo = true;
+                    } else {
                         for region in &band_regions {
-                            if region.action != SelectionAction::Solo {
-                                continue;
-                            }
-                            if frame_index >= region.start && frame_index < region.end {
-                                value += region.band[c].get(frame_index).copied().unwrap_or(0.0);
-                            }
-                        }
-                        frame[c] = value * factor;
-                    }
-                    // Non-solo band regions still apply on top (mute/gain).
-                    for region in &band_regions {
-                        if region.action == SelectionAction::Solo {
-                            continue;
-                        }
-                        if frame_index < region.start || frame_index >= region.end {
-                            continue;
-                        }
-                        for c in 0..channels {
-                            let band_value =
-                                region.band[c].get(frame_index).copied().unwrap_or(0.0);
-                            match region.action {
-                                SelectionAction::Mute => frame[c] -= band_value,
-                                SelectionAction::Gain => {
-                                    frame[c] += band_value * (region.gain - 1.0)
+                            if region.action == SelectionAction::Solo
+                                && frame_index >= region.start
+                                && frame_index < region.end
+                            {
+                                for c in 0..channels {
+                                    frame[c] +=
+                                        region.band[c].get(frame_index).copied().unwrap_or(0.0);
                                 }
-                                SelectionAction::Solo => unreachable!(),
+                                in_any_solo = true;
                             }
                         }
+                    }
+                    if !in_any_solo {
+                        frame.fill(0.0);
                     }
                 } else {
                     for region in &band_regions {
@@ -381,16 +350,12 @@ fn render_range(
                                 region.band[c].get(frame_index).copied().unwrap_or(0.0);
                             match region.action {
                                 // Remove the band from the (full-band processed) dry.
-                                SelectionAction::Mute => frame[c] -= band_value,
                                 // Scale only the band: dry + band * (gain - 1).
                                 SelectionAction::Gain => {
                                     frame[c] += band_value * (region.gain - 1.0)
                                 }
                                 SelectionAction::Solo => {
-                                    // Single band solo with no other band solo:
-                                    // keep dry outside handled above; inside the
-                                    // window output only the band.
-                                    frame[c] = band_value;
+                                    unreachable!("solo handled by band-solo branch")
                                 }
                             }
                         }
@@ -399,7 +364,6 @@ fn render_range(
                 frame_index += 1;
             }
         });
-    let _ = dry;
     output
 }
 
@@ -701,9 +665,10 @@ mod tests {
     }
 
     #[test]
-    fn full_band_mute_preview_is_silent_in_window() {
+    fn full_band_zero_gain_preview_is_silent_in_window() {
         let audio = tone(48_000, 440.0, 48_000);
-        let sel = Selection::new(1, 0.25, 0.5, 0.0, 24_000.0, SelectionAction::Mute, true);
+        let mut sel = Selection::new(1, 0.25, 0.5, 0.0, 24_000.0, SelectionAction::Gain, true);
+        sel.gain = 0.0;
         let preview = render_full(&audio, std::slice::from_ref(&sel));
         assert!(preview[12_000..24_000].iter().all(|v| v.abs() < 1.0e-6));
         assert!(preview[1_000..11_000].iter().any(|v| v.abs() > 1.0e-3));
@@ -712,7 +677,8 @@ mod tests {
     #[test]
     fn incremental_render_matches_fresh_full_render() {
         let audio = tone(96_000, 440.0, 48_000);
-        let sel_a = Selection::new(1, 0.5, 1.0, 0.0, 24_000.0, SelectionAction::Mute, true);
+        let mut sel_a = Selection::new(1, 0.5, 1.0, 0.0, 24_000.0, SelectionAction::Gain, true);
+        sel_a.gain = 0.0;
 
         let mut cache = PreviewCache::new();
         let out_a = cache.render(&audio, std::slice::from_ref(&sel_a));
@@ -743,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn band_mute_attenuates_without_double_silencing() {
+    fn zero_gain_band_attenuates_without_double_silencing() {
         let sample_rate = 48_000;
         let frames = 96_000;
         let audio = AudioData {
@@ -758,9 +724,10 @@ mod tests {
             channels: 1,
             duration: frames as f32 / sample_rate as f32,
         };
-        // Mute 700-1400 Hz only between 0.5 and 1.5 s; outside that window the
+        // Set gain to zero for 700-1400 Hz only between 0.5 and 1.5 s; outside that window the
         // 9 kHz tone AND the 1 kHz tone must both survive at full level.
-        let sel = Selection::new(1, 0.5, 1.5, 700.0, 1400.0, SelectionAction::Mute, false);
+        let mut sel = Selection::new(1, 0.5, 1.5, 700.0, 1400.0, SelectionAction::Gain, false);
+        sel.gain = 0.0;
         let out = render_full(&audio, std::slice::from_ref(&sel));
 
         let before = 4800..19_200; // 0.1-0.4 s, outside the window
@@ -776,11 +743,11 @@ mod tests {
         // Removing one of two equal-amplitude tones drops RMS by ~sqrt(2).
         assert!(
             out_inside < dry_inside * 0.85,
-            "band mute did not attenuate: {out_inside} vs {dry_inside}"
+            "zero-gain band did not attenuate: {out_inside} vs {dry_inside}"
         );
         assert!(
             out_inside > dry_inside * 0.45,
-            "band mute over-attenuated (double silence?): {out_inside} vs {dry_inside}"
+            "zero-gain band over-attenuated (double silence?): {out_inside} vs {dry_inside}"
         );
         assert!(out.iter().all(|v| v.is_finite()));
     }
@@ -799,7 +766,8 @@ mod tests {
             channels: 1,
             duration: 2.0,
         };
-        let sel = Selection::new(1, 0.25, 0.75, 700.0, 1400.0, SelectionAction::Mute, false);
+        let mut sel = Selection::new(1, 0.25, 0.75, 700.0, 1400.0, SelectionAction::Gain, false);
+        sel.gain = 0.0;
         let mut cache = PreviewCache::new();
         cache.render(&audio, std::slice::from_ref(&sel));
         assert_eq!(cache.band_signals.len(), 1);
@@ -820,7 +788,8 @@ mod tests {
     fn cache_rebuilds_on_audio_change() {
         let audio1 = tone(48_000, 440.0, 48_000);
         let audio2 = tone(48_000, 880.0, 48_000);
-        let sel = Selection::new(1, 0.25, 0.5, 0.0, 24_000.0, SelectionAction::Mute, true);
+        let mut sel = Selection::new(1, 0.25, 0.5, 0.0, 24_000.0, SelectionAction::Gain, true);
+        sel.gain = 0.0;
         let mut cache = PreviewCache::new();
         cache.render(&audio1, std::slice::from_ref(&sel));
         let out = cache.render(&audio2, std::slice::from_ref(&sel));
@@ -846,7 +815,8 @@ mod tests {
             channels: 2,
             duration: 1.0,
         };
-        let sel = Selection::new(1, 0.25, 0.75, 700.0, 1400.0, SelectionAction::Mute, false);
+        let mut sel = Selection::new(1, 0.25, 0.75, 700.0, 1400.0, SelectionAction::Gain, false);
+        sel.gain = 0.0;
         let out = render_full(&audio, std::slice::from_ref(&sel));
         // Right channel must stay silent everywhere.
         assert!(out.chunks_exact(2).all(|frame| frame[1].abs() < 1.0e-5));

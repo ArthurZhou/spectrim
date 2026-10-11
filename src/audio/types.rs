@@ -81,7 +81,6 @@ impl Spectrogram {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SelectionAction {
-    Mute,
     Solo,
     Gain,
 }
@@ -94,7 +93,7 @@ pub struct Selection {
     pub freq_low: f32,
     pub freq_high: f32,
     pub action: SelectionAction,
-    /// Linear gain multiplier used when `action` is `Gain`.
+    /// Linear gain multiplier used by `Gain` and `Solo` selections.
     pub gain: f32,
     pub full_band: bool,
 }

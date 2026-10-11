@@ -36,12 +36,10 @@ pub fn show(
                 let previous = selection.action;
                 egui::ComboBox::from_id_salt(("action", selection.id))
                     .selected_text(match selection.action {
-                        SelectionAction::Mute => "Mute",
                         SelectionAction::Solo => "Solo",
                         SelectionAction::Gain => "Gain",
                     })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut selection.action, SelectionAction::Mute, "Mute");
                         ui.selectable_value(&mut selection.action, SelectionAction::Solo, "Solo");
                         ui.selectable_value(&mut selection.action, SelectionAction::Gain, "Gain");
                     });
@@ -74,7 +72,7 @@ pub fn show(
                 ui.horizontal(|ui| {
                     ui.label("Gain");
                     events.changed |= ui
-                        .add(egui::Slider::new(&mut selection.gain, 0.0..=2.0).suffix("×"))
+                        .add(egui::Slider::new(&mut selection.gain, 0.0..=4.0).suffix("×"))
                         .changed();
                 });
             }

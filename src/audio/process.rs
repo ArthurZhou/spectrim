@@ -56,19 +56,22 @@ pub fn apply_time_domain(audio: &AudioData, selections: &[Selection]) -> Vec<f32
                 let in_solo = resolved.iter().any(|region| {
                     region.action == SelectionAction::Solo && region.contains_time(time)
                 });
-                let in_mute = resolved.iter().any(|region| {
-                    region.action == SelectionAction::Mute && region.contains_time(time)
-                });
-                if (has_solo && !in_solo) || (!has_solo && in_mute) {
+                if has_solo && !in_solo {
                     frame.fill(0.0);
                 } else {
-                    let gain = resolved
-                        .iter()
-                        .filter(|region| {
-                            region.action == SelectionAction::Gain && region.contains_time(time)
-                        })
-                        .map(|region| region.gain)
-                        .product::<f32>();
+                    // Solo is exclusive: ignore Gain actions whenever a Solo
+                    // selection exists; outside Solo windows is already silent.
+                    let gain = if has_solo {
+                        1.0
+                    } else {
+                        resolved
+                            .iter()
+                            .filter(|region| {
+                                region.action == SelectionAction::Gain && region.contains_time(time)
+                            })
+                            .map(|region| region.gain)
+                            .product::<f32>()
+                    };
                     for sample in frame {
                         *sample *= gain;
                     }
@@ -303,19 +306,13 @@ pub fn apply_spectral_masks(
                                         }
                                     }
                                 }
-                                SelectionAction::Mute => {
+                                SelectionAction::Gain => {
                                     if !has_solo {
                                         for slot in
-                                            keep[region.bin_start..=region.bin_end].iter_mut()
+                                            gains[region.bin_start..=region.bin_end].iter_mut()
                                         {
-                                            *slot = false;
+                                            *slot *= region.gain;
                                         }
-                                    }
-                                }
-                                SelectionAction::Gain => {
-                                    for slot in gains[region.bin_start..=region.bin_end].iter_mut()
-                                    {
-                                        *slot *= region.gain;
                                     }
                                 }
                             }
@@ -414,12 +411,13 @@ mod tests {
     }
 
     #[test]
-    fn time_domain_mute_and_solo_are_applied() {
+    fn zero_gain_and_solo_are_applied() {
         let audio = sample_audio();
-        let mute = Selection::new(1, 0.5, 1.0, 0.0, 500.0, SelectionAction::Mute, true);
-        let muted = apply_time_domain(&audio, &[mute]);
-        assert!(muted[500..1000].iter().all(|sample| *sample == 0.0));
-        assert!(muted[0..400].iter().any(|sample| *sample != 0.0));
+        let mut gain = Selection::new(1, 0.5, 1.0, 0.0, 500.0, SelectionAction::Gain, true);
+        gain.gain = 0.0;
+        let zeroed = apply_time_domain(&audio, &[gain]);
+        assert!(zeroed[500..1000].iter().all(|sample| *sample == 0.0));
+        assert!(zeroed[0..400].iter().any(|sample| *sample != 0.0));
 
         let solo = Selection::new(2, 0.5, 1.0, 0.0, 500.0, SelectionAction::Solo, true);
         let soloed = apply_time_domain(&audio, &[solo]);
@@ -441,15 +439,15 @@ mod tests {
     #[test]
     fn spectral_processing_preserves_length_and_finite_values() {
         let audio = sample_audio();
-        let mute = Selection::new(1, 0.2, 1.5, 50.0, 200.0, SelectionAction::Mute, false);
-        let output = apply_spectral_masks(&audio, &[mute], 256, 64);
+        let mut gain = Selection::new(1, 0.2, 1.5, 50.0, 200.0, SelectionAction::Gain, false);
+        gain.gain = 0.0;
+        let output = apply_spectral_masks(&audio, &[gain], 256, 64);
         assert_eq!(output.len(), audio.samples.len());
         assert!(output.iter().all(|sample| sample.is_finite()));
     }
 
-    /// The precomputed frame/bin ranges must reproduce the original per-bin
-    /// predicate evaluation bit-for-bit. This is a straight reimplementation of
-    /// the old sequential inner loop, kept as a reference oracle.
+    /// The precomputed frame/bin ranges must reproduce the current per-bin
+    /// predicate evaluation. This reimplementation is kept as a reference oracle.
     fn reference_masks(
         audio: &AudioData,
         selections: &[Selection],
@@ -492,23 +490,23 @@ mod tests {
                         .iter()
                         .filter(|s| s.action == SelectionAction::Solo)
                         .any(in_bounds);
-                    let in_mute = selections
-                        .iter()
-                        .filter(|s| s.action == SelectionAction::Mute)
-                        .any(in_bounds);
-                    let keep = if has_solo { in_solo } else { !in_mute };
+                    let keep = if has_solo { in_solo } else { true };
                     if !keep {
                         spectrum[bin] = Complex32::default();
                         if bin > 0 && bin < n_fft / 2 {
                             spectrum[n_fft - bin] = Complex32::default();
                         }
                     } else {
-                        let gain = selections
-                            .iter()
-                            .filter(|s| s.action == SelectionAction::Gain)
-                            .filter(|s| in_bounds(s))
-                            .map(|s| s.gain.clamp(0.0, 4.0))
-                            .product::<f32>();
+                        let gain = if has_solo {
+                            1.0
+                        } else {
+                            selections
+                                .iter()
+                                .filter(|s| s.action == SelectionAction::Gain)
+                                .filter(|s| in_bounds(s))
+                                .map(|s| s.gain.clamp(0.0, 4.0))
+                                .product::<f32>()
+                        };
                         spectrum[bin] *= gain;
                         if bin > 0 && bin < n_fft / 2 {
                             spectrum[n_fft - bin] *= gain;
@@ -557,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_masks_match_sequential_reference_band_mute() {
+    fn parallel_masks_match_sequential_reference_zero_gain() {
         let audio = noisy_audio(8_000, 8_000, 1);
         let selections = vec![Selection::new(
             1,
@@ -565,7 +563,7 @@ mod tests {
             0.7,
             200.0,
             900.0,
-            SelectionAction::Mute,
+            SelectionAction::Gain,
             false,
         )];
         let got = apply_spectral_masks(&audio, &selections, 256, 64);
@@ -576,27 +574,21 @@ mod tests {
             .zip(want.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert!(max_err < 1.0e-4, "band mute drift {max_err}");
+        assert!(max_err < 1.0e-4, "zero-gain band drift {max_err}");
     }
 
     #[test]
-    fn parallel_masks_match_sequential_reference_solo_and_gain() {
+    fn solo_ignores_other_gain_regions() {
         let audio = noisy_audio(8_000, 8_000, 2);
         let selections = vec![
             Selection::new(1, 0.1, 0.6, 250.0, 1_500.0, SelectionAction::Solo, false),
             Selection::new(2, 0.3, 0.9, 100.0, 3_000.0, SelectionAction::Gain, false),
-            Selection::new(3, 0.0, 1.0, 0.0, 4_000.0, SelectionAction::Mute, true),
         ];
         let mut selections = selections;
         selections[1].gain = 1.5;
         let got = apply_spectral_masks(&audio, &selections, 256, 64);
-        let want = reference_masks(&audio, &selections, 256, 64);
-        let max_err = got
-            .iter()
-            .zip(want.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(max_err < 1.0e-4, "solo/gain drift {max_err}");
+        let solo_only = apply_spectral_masks(&audio, &selections[..1], 256, 64);
+        assert_eq!(got, solo_only);
     }
 
     #[test]
@@ -604,15 +596,17 @@ mod tests {
         // hop=64 at 8 kHz -> one frame is exactly 8 ms; pick edges on that grid
         // so the inclusive boundary logic is exercised.
         let audio = noisy_audio(4_000, 8_000, 1);
-        let selections = vec![Selection::new(
+        let mut selection = Selection::new(
             1,
             0.008 * 10.0,
             0.008 * 40.0,
             8_000.0 / 256.0 * 20.0,
             8_000.0 / 256.0 * 60.0,
-            SelectionAction::Mute,
+            SelectionAction::Gain,
             false,
-        )];
+        );
+        selection.gain = 0.0;
+        let selections = vec![selection];
         let got = apply_spectral_masks(&audio, &selections, 256, 64);
         let want = reference_masks(&audio, &selections, 256, 64);
         let max_err = got
@@ -632,7 +626,7 @@ mod tests {
             9.0,
             100.0,
             500.0,
-            SelectionAction::Mute,
+            SelectionAction::Gain,
             false,
         )];
         let got = apply_spectral_masks(&audio, &selections, 256, 64);
@@ -651,8 +645,11 @@ mod tests {
     #[test]
     fn time_domain_parallel_matches_sequential() {
         let audio = noisy_audio(20_000, 44_100, 2);
+        let mut zero_gain_region =
+            Selection::new(1, 0.05, 0.2, 0.0, 20_000.0, SelectionAction::Gain, true);
+        zero_gain_region.gain = 0.0;
         let selections = vec![
-            Selection::new(1, 0.05, 0.2, 0.0, 20_000.0, SelectionAction::Mute, true),
+            zero_gain_region,
             Selection::new(2, 0.1, 0.35, 0.0, 20_000.0, SelectionAction::Gain, true),
         ];
         let mut selections = selections;
@@ -664,13 +661,13 @@ mod tests {
         let mut want = audio.samples.clone();
         for (frame_index, frame) in want.chunks_exact_mut(channels).enumerate() {
             let time = frame_index as f32 / audio.sample_rate as f32;
-            let in_mute = time >= selections[0].time_start && time <= selections[0].time_end;
+            let gain_zero = time >= selections[0].time_start && time <= selections[0].time_end;
             let gain = if time >= selections[1].time_start && time <= selections[1].time_end {
                 selections[1].gain
             } else {
                 1.0
             };
-            if in_mute {
+            if gain_zero {
                 frame.fill(0.0);
             } else {
                 for sample in frame {

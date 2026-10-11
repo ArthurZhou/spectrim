@@ -149,7 +149,6 @@ impl SpectrogramView {
             let bottom = hz_to_y(selection.freq_low).clamp(plot.top(), plot.bottom());
             let rect = egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom));
             let color = match selection.action {
-                SelectionAction::Mute => egui::Color32::from_rgb(110, 120, 145),
                 SelectionAction::Solo => egui::Color32::from_rgb(40, 190, 185),
                 SelectionAction::Gain => egui::Color32::from_rgb(250, 170, 50),
             };
