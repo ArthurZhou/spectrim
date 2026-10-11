@@ -25,17 +25,31 @@ pub fn apply_time_domain(audio: &AudioData, selections: &[Selection]) -> Vec<f32
     let mut output = audio.samples.clone();
     for (frame_index, frame) in output.chunks_exact_mut(channels).enumerate() {
         let time = frame_index as f32 / audio.sample_rate.max(1) as f32;
-        let covered = selections.iter().any(|selection| {
-            let action_matches = if has_solo {
-                selection.action == SelectionAction::Solo
-            } else {
-                selection.action == SelectionAction::Mute
-            };
-            action_matches && time >= selection.time_start && time <= selection.time_end
+        let in_solo = selections.iter().any(|selection| {
+            selection.action == SelectionAction::Solo
+                && time >= selection.time_start
+                && time <= selection.time_end
         });
-        let keep = if has_solo { covered } else { !covered };
-        if !keep {
+        let in_mute = selections.iter().any(|selection| {
+            selection.action == SelectionAction::Mute
+                && time >= selection.time_start
+                && time <= selection.time_end
+        });
+        if (has_solo && !in_solo) || (!has_solo && in_mute) {
             frame.fill(0.0);
+        } else {
+            let gain = selections
+                .iter()
+                .filter(|selection| {
+                    selection.action == SelectionAction::Gain
+                        && time >= selection.time_start
+                        && time <= selection.time_end
+                })
+                .map(|selection| selection.gain.clamp(0.0, 4.0))
+                .product::<f32>();
+            for sample in frame {
+                *sample *= gain;
+            }
         }
     }
     output
@@ -80,24 +94,37 @@ pub fn apply_spectral_masks(
             forward.process(&mut spectrum);
             for bin in 0..n_freq {
                 let frequency = bin as f32 * audio.sample_rate as f32 / n_fft as f32;
-                let matching = selections.iter().any(|selection| {
-                    let action_matches = if has_solo {
-                        selection.action == SelectionAction::Solo
-                    } else {
-                        selection.action == SelectionAction::Mute
-                    };
-                    action_matches
-                        && time >= selection.time_start
+                let in_bounds = |selection: &Selection| {
+                    time >= selection.time_start
                         && time <= selection.time_end
                         && (selection.full_band
                             || (frequency >= selection.freq_low
                                 && frequency <= selection.freq_high))
-                });
-                let keep = if has_solo { matching } else { !matching };
+                };
+                let in_solo = selections
+                    .iter()
+                    .filter(|selection| selection.action == SelectionAction::Solo)
+                    .any(in_bounds);
+                let in_mute = selections
+                    .iter()
+                    .filter(|selection| selection.action == SelectionAction::Mute)
+                    .any(in_bounds);
+                let keep = if has_solo { in_solo } else { !in_mute };
                 if !keep {
                     spectrum[bin] = Complex32::default();
                     if bin > 0 && bin < n_fft / 2 {
                         spectrum[n_fft - bin] = Complex32::default();
+                    }
+                } else {
+                    let gain = selections
+                        .iter()
+                        .filter(|selection| selection.action == SelectionAction::Gain)
+                        .filter(|selection| in_bounds(selection))
+                        .map(|selection| selection.gain.clamp(0.0, 4.0))
+                        .product::<f32>();
+                    spectrum[bin] *= gain;
+                    if bin > 0 && bin < n_fft / 2 {
+                        spectrum[n_fft - bin] *= gain;
                     }
                 }
             }
@@ -148,6 +175,17 @@ mod tests {
         let soloed = apply_time_domain(&audio, &[solo]);
         assert!(soloed[0..500].iter().all(|sample| *sample == 0.0));
         assert!(soloed[500..1000].iter().any(|sample| *sample != 0.0));
+    }
+
+    #[test]
+    fn gain_region_applies_linear_multiplier() {
+        let audio = sample_audio();
+        let gain = Selection::new(1, 0.5, 1.0, 0.0, 500.0, SelectionAction::Gain, true);
+        let output = apply_time_domain(&audio, &[gain]);
+        for (index, sample) in output.iter().enumerate().take(1000).skip(500) {
+            assert!((*sample - audio.samples[index] * 0.5).abs() < 1.0e-6);
+        }
+        assert_eq!(output[100], audio.samples[100]);
     }
 
     #[test]

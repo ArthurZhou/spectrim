@@ -11,8 +11,6 @@ pub enum AudioCmd {
         sample_rate: u32,
         channels: u16,
     },
-    Pause,
-    Resume,
     Stop,
 }
 
@@ -59,20 +57,6 @@ impl PlaybackHandle {
                         paused_total = Duration::ZERO;
                         thread_position.store(0, Ordering::Relaxed);
                     }
-                    Ok(AudioCmd::Pause) => {
-                        if let Some(active) = &sink {
-                            active.pause();
-                            paused_at = Some(Instant::now());
-                        }
-                    }
-                    Ok(AudioCmd::Resume) => {
-                        if let Some(active) = &sink {
-                            active.play();
-                            if let Some(pause_start) = paused_at.take() {
-                                paused_total += pause_start.elapsed();
-                            }
-                        }
-                    }
                     Ok(AudioCmd::Stop) => {
                         if let Some(active) = sink.take() {
                             active.stop();
@@ -108,12 +92,6 @@ impl PlaybackHandle {
             sample_rate,
             channels,
         });
-    }
-    pub fn pause(&self) {
-        let _ = self.tx.send(AudioCmd::Pause);
-    }
-    pub fn resume(&self) {
-        let _ = self.tx.send(AudioCmd::Resume);
     }
     pub fn stop(&self) {
         let _ = self.tx.send(AudioCmd::Stop);

@@ -33,6 +33,7 @@ pub struct SpectrimApp {
     playback: PlaybackHandle,
     is_playing: bool,
     paused: bool,
+    playhead_time: f32,
     processed_mode: bool,
     processed_samples: Option<Vec<f32>>,
     selections: Vec<Selection>,
@@ -53,6 +54,7 @@ impl Default for SpectrimApp {
             playback: PlaybackHandle::spawn(),
             is_playing: false,
             paused: false,
+            playhead_time: 0.0,
             processed_mode: false,
             processed_samples: None,
             selections: Vec::new(),
@@ -68,6 +70,8 @@ impl SpectrimApp {
     fn start_load(&mut self, path: PathBuf) {
         self.playback.stop();
         self.is_playing = false;
+        self.paused = false;
+        self.playhead_time = 0.0;
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
         self.status = format!("Loading and analyzing {}…", path.display());
@@ -104,6 +108,8 @@ impl SpectrimApp {
                         spectrogram: spec,
                         texture,
                     });
+                    self.playhead_time = 0.0;
+                    self.spectrogram_view = SpectrogramView::default();
                     self.selections.clear();
                     self.processed_samples = None;
                     self.status = "Audio loaded successfully.".to_owned();
@@ -122,8 +128,11 @@ impl SpectrimApp {
             if let Some(loaded) = &self.loaded {
                 if self.processed_mode {
                     if let Some(samples) = &self.processed_samples {
+                        let start_frame = (self.playhead_time * loaded.audio.sample_rate as f32)
+                            as usize
+                            * loaded.audio.channels as usize;
                         self.playback.play(
-                            samples.clone(),
+                            samples[start_frame.min(samples.len())..].to_vec(),
                             loaded.audio.sample_rate,
                             loaded.audio.channels,
                         );
@@ -159,16 +168,20 @@ impl SpectrimApp {
             return;
         };
         if !self.processed_mode {
+            let start_frame = (self.playhead_time * loaded.audio.sample_rate as f32) as usize
+                * loaded.audio.channels as usize;
             self.playback.play(
-                loaded.audio.samples.clone(),
+                loaded.audio.samples[start_frame.min(loaded.audio.samples.len())..].to_vec(),
                 loaded.audio.sample_rate,
                 loaded.audio.channels,
             );
             self.is_playing = true;
             self.paused = false;
         } else if let Some(samples) = &self.processed_samples {
+            let start_frame = (self.playhead_time * loaded.audio.sample_rate as f32) as usize
+                * loaded.audio.channels as usize;
             self.playback.play(
-                samples.clone(),
+                samples[start_frame.min(samples.len())..].to_vec(),
                 loaded.audio.sample_rate,
                 loaded.audio.channels,
             );
@@ -216,6 +229,9 @@ impl SpectrimApp {
     fn selections_changed(&mut self) {
         self.processed_samples = None;
         if self.processed_mode {
+            if self.is_playing {
+                self.playhead_time += self.playback.position();
+            }
             self.playback.stop();
             self.is_playing = false;
             self.paused = false;
@@ -227,7 +243,11 @@ impl eframe::App for SpectrimApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_workers(ctx);
         let processing = self.processing_receiver.is_some() || self.export_receiver.is_some();
-        let current_time = self.playback.position();
+        let current_time = if self.is_playing {
+            self.playhead_time + self.playback.position()
+        } else {
+            self.playhead_time
+        };
         let duration = self
             .loaded
             .as_ref()
@@ -235,6 +255,7 @@ impl eframe::App for SpectrimApp {
         if self.is_playing && duration > 0.0 && current_time >= duration {
             self.is_playing = false;
             self.paused = false;
+            self.playhead_time = duration;
         }
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
@@ -257,15 +278,13 @@ impl eframe::App for SpectrimApp {
                 );
                 if events.play {
                     if self.paused {
-                        self.playback.resume();
-                        self.is_playing = true;
                         self.paused = false;
-                    } else {
-                        self.play();
                     }
+                    self.play();
                 }
                 if events.pause {
-                    self.playback.pause();
+                    self.playhead_time = current_time;
+                    self.playback.stop();
                     self.is_playing = false;
                     self.paused = true;
                 }
@@ -273,11 +292,13 @@ impl eframe::App for SpectrimApp {
                     self.playback.stop();
                     self.is_playing = false;
                     self.paused = false;
+                    self.playhead_time = 0.0;
                 }
                 ui.separator();
                 ui.label("New selection:");
                 ui.selectable_value(&mut self.default_action, SelectionAction::Mute, "Mute");
                 ui.selectable_value(&mut self.default_action, SelectionAction::Solo, "Solo");
+                ui.selectable_value(&mut self.default_action, SelectionAction::Gain, "Gain");
                 if ui
                     .add_enabled(
                         self.loaded.is_some() && !processing,
@@ -303,13 +324,14 @@ impl eframe::App for SpectrimApp {
                 let events =
                     crate::ui::region_list::show(ui, &mut self.selections, self.selected_selection);
                 if let Some(selected) = events.selected {
-                    self.selected_selection = Some(selected);
+                    self.selected_selection = selected;
                 }
                 if events.changed {
                     self.selections_changed();
                 }
             });
 
+        let mut selections_modified = false;
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(loaded) = &self.loaded {
                 ui.horizontal(|ui| {
@@ -330,9 +352,36 @@ impl eframe::App for SpectrimApp {
                     Some(&loaded.texture),
                     &loaded.spectrogram,
                     &loaded.audio,
-                    &self.selections,
-                    self.is_playing.then_some(self.playback.position()),
+                    &mut self.selections,
+                    self.selected_selection,
+                    current_time,
                 );
+                if let Some(selected) = events.selected {
+                    self.selected_selection = selected;
+                }
+                if events.selections_changed {
+                    selections_modified = true;
+                }
+                if let Some(time) = events.seek_to {
+                    self.playhead_time = time.clamp(0.0, loaded.audio.duration);
+                    if self.is_playing {
+                        let start_frame = (self.playhead_time * loaded.audio.sample_rate as f32)
+                            as usize
+                            * loaded.audio.channels as usize;
+                        let samples = if self.processed_mode {
+                            self.processed_samples
+                                .as_ref()
+                                .unwrap_or(&loaded.audio.samples)
+                        } else {
+                            &loaded.audio.samples
+                        };
+                        self.playback.play(
+                            samples[start_frame.min(samples.len())..].to_vec(),
+                            loaded.audio.sample_rate,
+                            loaded.audio.channels,
+                        );
+                    }
+                }
                 if let Some((time_start, time_end, freq_low, freq_high, full_band)) = events.created
                 {
                     self.selections.push(Selection::new(
@@ -346,14 +395,14 @@ impl eframe::App for SpectrimApp {
                     ));
                     self.selected_selection = Some(self.next_selection_id);
                     self.next_selection_id += 1;
-                    self.selections_changed();
+                    selections_modified = true;
                 }
                 if let Some(id) = events.deleted {
                     self.selections.retain(|selection| selection.id != id);
                     if self.selected_selection == Some(id) {
                         self.selected_selection = None;
                     }
-                    self.selections_changed();
+                    selections_modified = true;
                 }
             } else {
                 ui.centered_and_justified(|ui| {
@@ -361,6 +410,9 @@ impl eframe::App for SpectrimApp {
                 });
             }
         });
+        if selections_modified {
+            self.selections_changed();
+        }
 
         egui::TopBottomPanel::bottom("status_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -376,13 +428,13 @@ impl eframe::App for SpectrimApp {
         }
         if ctx.input(|input| input.key_pressed(egui::Key::Space)) {
             if self.is_playing {
-                self.playback.pause();
+                self.playback.stop();
+                self.playhead_time = current_time;
                 self.is_playing = false;
                 self.paused = true;
             } else if self.paused {
-                self.playback.resume();
-                self.is_playing = true;
                 self.paused = false;
+                self.play();
             } else {
                 self.play();
             }

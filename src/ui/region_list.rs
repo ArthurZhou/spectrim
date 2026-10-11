@@ -6,7 +6,7 @@ use crate::audio::types::{Selection, SelectionAction};
 pub struct RegionEvents {
     pub changed: bool,
     pub deleted: Vec<u64>,
-    pub selected: Option<u64>,
+    pub selected: Option<Option<u64>>,
 }
 
 pub fn show(
@@ -27,17 +27,23 @@ pub fn show(
                     )
                     .clicked()
                 {
-                    events.selected = Some(selection.id);
+                    events.selected = Some(if selected_id == Some(selection.id) {
+                        None
+                    } else {
+                        Some(selection.id)
+                    });
                 }
                 let previous = selection.action;
                 egui::ComboBox::from_id_salt(("action", selection.id))
                     .selected_text(match selection.action {
                         SelectionAction::Mute => "Mute",
                         SelectionAction::Solo => "Solo",
+                        SelectionAction::Gain => "Gain",
                     })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut selection.action, SelectionAction::Mute, "Mute");
                         ui.selectable_value(&mut selection.action, SelectionAction::Solo, "Solo");
+                        ui.selectable_value(&mut selection.action, SelectionAction::Gain, "Gain");
                     });
                 if previous != selection.action {
                     events.changed = true;
@@ -64,6 +70,14 @@ pub fn show(
                     )
                     .changed();
             });
+            if selection.action == SelectionAction::Gain {
+                ui.horizontal(|ui| {
+                    ui.label("Gain");
+                    events.changed |= ui
+                        .add(egui::Slider::new(&mut selection.gain, 0.0..=2.0).suffix("×"))
+                        .changed();
+                });
+            }
             ui.horizontal(|ui| {
                 ui.label("Hz");
                 events.changed |= ui

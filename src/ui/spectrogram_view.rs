@@ -4,12 +4,43 @@ use crate::audio::types::{AudioData, Selection, SelectionAction, Spectrogram};
 
 #[derive(Default)]
 pub struct SpectrogramView {
-    drag_origin: Option<egui::Pos2>,
+    time_range: Option<(f32, f32)>,
+    frequency_range: Option<(f32, f32)>,
+    drag: Option<DragMode>,
+}
+
+#[derive(Clone, Copy)]
+enum DragMode {
+    Create(egui::Pos2),
+    Move {
+        id: u64,
+        last: egui::Pos2,
+    },
+    Resize {
+        id: u64,
+        corner: ResizeCorner,
+        last: egui::Pos2,
+    },
+    Playhead,
+    Pan {
+        last: egui::Pos2,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum ResizeCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
 }
 
 pub struct ViewEvents {
     pub created: Option<(f32, f32, f32, f32, bool)>,
     pub deleted: Option<u64>,
+    pub selected: Option<Option<u64>>,
+    pub seek_to: Option<f32>,
+    pub selections_changed: bool,
 }
 
 impl SpectrogramView {
@@ -20,126 +51,388 @@ impl SpectrogramView {
         texture: Option<&egui::TextureHandle>,
         spectrogram: &Spectrogram,
         audio: &AudioData,
-        selections: &[Selection],
-        playhead: Option<f32>,
+        selections: &mut [Selection],
+        selected_id: Option<u64>,
+        playhead: f32,
     ) -> ViewEvents {
-        let available = ui.available_size().max(egui::vec2(64.0, 64.0));
-        let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
-        if let Some(texture) = texture {
-            ui.painter().image(
-                texture.id(),
-                rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-        } else {
-            ui.painter()
-                .rect_filled(rect, 0.0, egui::Color32::from_gray(24));
-        }
+        let outer = ui.available_rect_before_wrap();
+        let plot = egui::Rect::from_min_max(
+            egui::pos2(outer.left() + 58.0, outer.top() + 8.0),
+            egui::pos2(outer.right() - 12.0, outer.bottom() - 32.0),
+        );
+        let _ = ui.allocate_rect(outer, egui::Sense::hover());
+        let response = ui.interact(
+            plot,
+            ui.id().with("spectrogram_plot"),
+            egui::Sense::click_and_drag(),
+        );
 
-        let duration = audio.duration.max(0.0001);
-        let nyquist = audio.sample_rate as f32 / 2.0;
+        let duration = audio.duration.max(0.001);
+        let nyquist = (audio.sample_rate as f32 * 0.5).max(1.0);
+        let (time_start, time_end) = self.time_range.unwrap_or((0.0, duration));
+        let (freq_low, freq_high) = self.frequency_range.unwrap_or((0.0, nyquist));
+        let time_span = (time_end - time_start).max(0.001);
+        let freq_span = (freq_high - freq_low).max(1.0);
+        let time_to_x = |time: f32| plot.left() + plot.width() * (time - time_start) / time_span;
+        let hz_to_y = |hz: f32| plot.bottom() - plot.height() * (hz - freq_low) / freq_span;
         let point_to_values = |point: egui::Pos2| {
-            let x = ((point.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-            let y = (1.0 - (point.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
-            (x * duration, y * nyquist)
+            let time = time_start + (point.x - plot.left()) / plot.width() * time_span;
+            let hz = freq_low + (plot.bottom() - point.y) / plot.height() * freq_span;
+            (time.clamp(0.0, duration), hz.clamp(0.0, nyquist))
         };
 
-        for selection in selections {
-            let left =
-                rect.left() + rect.width() * (selection.time_start / duration).clamp(0.0, 1.0);
-            let right =
-                rect.left() + rect.width() * (selection.time_end / duration).clamp(0.0, 1.0);
-            let low_y = rect.bottom()
-                - rect.height() * (selection.freq_low / nyquist.max(1.0)).clamp(0.0, 1.0);
-            let high_y = rect.bottom()
-                - rect.height() * (selection.freq_high / nyquist.max(1.0)).clamp(0.0, 1.0);
-            let selection_rect =
-                egui::Rect::from_min_max(egui::pos2(left, high_y), egui::pos2(right, low_y));
+        ui.painter()
+            .rect_filled(plot, 0.0, egui::Color32::from_gray(20));
+        if let Some(texture) = texture {
+            // Color image rows are high-to-low frequency, so UV y is mapped high-to-low as well.
+            let uv = egui::Rect::from_min_max(
+                egui::pos2(time_start / duration, 1.0 - freq_high / nyquist),
+                egui::pos2(time_end / duration, 1.0 - freq_low / nyquist),
+            );
+            ui.painter()
+                .image(texture.id(), plot, uv, egui::Color32::WHITE);
+        }
+
+        let mut shapes = Vec::new();
+        let time_ticks = 5;
+        for index in 0..=time_ticks {
+            let fraction = index as f32 / time_ticks as f32;
+            let time = time_start + fraction * time_span;
+            let x = plot.left() + fraction * plot.width();
+            shapes.push(egui::Shape::line_segment(
+                [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
+                egui::Stroke::new(0.5_f32, egui::Color32::from_white_alpha(70)),
+            ));
+            ui.painter().text(
+                egui::pos2(x, plot.bottom() + 5.0),
+                egui::Align2::CENTER_TOP,
+                format_time(time),
+                egui::FontId::monospace(10.0),
+                egui::Color32::LIGHT_GRAY,
+            );
+        }
+        ui.painter().text(
+            egui::pos2(plot.center().x, outer.bottom() - 2.0),
+            egui::Align2::CENTER_BOTTOM,
+            "Time (s)",
+            egui::FontId::proportional(11.0),
+            egui::Color32::LIGHT_GRAY,
+        );
+        for index in 0..=5 {
+            let fraction = index as f32 / 5.0;
+            let hz = freq_low + (1.0 - fraction) * freq_span;
+            let y = plot.top() + fraction * plot.height();
+            shapes.push(egui::Shape::line_segment(
+                [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
+                egui::Stroke::new(0.5_f32, egui::Color32::from_white_alpha(70)),
+            ));
+            ui.painter().text(
+                egui::pos2(plot.left() - 6.0, y),
+                egui::Align2::RIGHT_CENTER,
+                format_frequency(hz),
+                egui::FontId::monospace(10.0),
+                egui::Color32::LIGHT_GRAY,
+            );
+        }
+        ui.painter().text(
+            egui::pos2(outer.left() + 9.0, plot.center().y),
+            egui::Align2::CENTER_CENTER,
+            "Frequency (Hz)",
+            egui::FontId::proportional(11.0),
+            egui::Color32::LIGHT_GRAY,
+        );
+        ui.painter().extend(shapes);
+
+        for selection in selections.iter() {
+            let left = time_to_x(selection.time_start).clamp(plot.left(), plot.right());
+            let right = time_to_x(selection.time_end).clamp(plot.left(), plot.right());
+            let top = hz_to_y(selection.freq_high).clamp(plot.top(), plot.bottom());
+            let bottom = hz_to_y(selection.freq_low).clamp(plot.top(), plot.bottom());
+            let rect = egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom));
             let color = match selection.action {
-                SelectionAction::Mute => egui::Color32::from_rgb(95, 105, 125),
+                SelectionAction::Mute => egui::Color32::from_rgb(110, 120, 145),
                 SelectionAction::Solo => egui::Color32::from_rgb(40, 190, 185),
+                SelectionAction::Gain => egui::Color32::from_rgb(250, 170, 50),
             };
             ui.painter()
-                .rect_filled(selection_rect, 0.0, color.gamma_multiply(0.28));
+                .rect_filled(rect, 0.0, color.gamma_multiply(0.25));
             ui.painter().rect_stroke(
-                selection_rect,
+                rect,
                 0.0,
-                egui::Stroke::new(2.0_f32, color),
+                egui::Stroke::new(
+                    if selected_id == Some(selection.id) {
+                        2.5_f32
+                    } else {
+                        1.5_f32
+                    },
+                    color,
+                ),
                 egui::StrokeKind::Inside,
             );
-        }
-
-        if let Some(time) = playhead {
-            let x = rect.left() + rect.width() * (time / duration).clamp(0.0, 1.0);
-            ui.painter().line_segment(
-                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
-            );
-        }
-
-        if response.drag_started() {
-            self.drag_origin = response.interact_pointer_pos();
-        }
-        if response.dragged() {
-            if let (Some(start), Some(end)) = (self.drag_origin, response.interact_pointer_pos()) {
-                ui.painter().rect_filled(
-                    egui::Rect::from_two_pos(start, end),
-                    0.0,
-                    egui::Color32::YELLOW.gamma_multiply(0.25),
-                );
-                ui.painter().rect_stroke(
-                    egui::Rect::from_two_pos(start, end),
-                    0.0,
-                    egui::Stroke::new(1.5_f32, egui::Color32::YELLOW),
-                    egui::StrokeKind::Inside,
-                );
-            }
-        }
-
-        let mut created = None;
-        if response.drag_stopped() {
-            if let (Some(start), Some(end)) =
-                (self.drag_origin.take(), response.interact_pointer_pos())
-            {
-                if (start.x - end.x).abs() > 4.0 && (start.y - end.y).abs() > 4.0 {
-                    let (t1, f1) = point_to_values(start);
-                    let (t2, f2) = point_to_values(end);
-                    let full_band = (start.y - rect.top()).abs() < 4.0
-                        && (end.y - rect.bottom()).abs() < 4.0
-                        || (end.y - rect.top()).abs() < 4.0
-                            && (start.y - rect.bottom()).abs() < 4.0;
-                    created = Some((t1.min(t2), t1.max(t2), f1.min(f2), f1.max(f2), full_band));
+            if selected_id == Some(selection.id) {
+                for handle in [
+                    egui::pos2(left, top),
+                    egui::pos2(right, top),
+                    egui::pos2(left, bottom),
+                    egui::pos2(right, bottom),
+                ] {
+                    ui.painter()
+                        .circle_filled(handle, 4.0, egui::Color32::WHITE);
                 }
             }
         }
 
-        let deleted = if response.secondary_clicked() {
-            response.interact_pointer_pos().and_then(|point| {
+        let playhead_x = time_to_x(playhead.clamp(0.0, duration)).clamp(plot.left(), plot.right());
+        ui.painter().line_segment(
+            [
+                egui::pos2(playhead_x, plot.top()),
+                egui::pos2(playhead_x, plot.bottom()),
+            ],
+            egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
+        );
+
+        let mut events = ViewEvents {
+            created: None,
+            deleted: None,
+            selected: None,
+            seek_to: None,
+            selections_changed: false,
+        };
+
+        let pointer = response.interact_pointer_pos();
+        if response.hovered() || response.dragged() {
+            if let Some(position) = pointer {
+                let (time, hz) = point_to_values(position);
+                response
+                    .clone()
+                    .on_hover_text(format!("Time: {:.3} s\nFrequency: {:.1} Hz", time, hz));
+            }
+        }
+
+        if response.hovered() {
+            let (scroll, zoom_frequency) =
+                ui.input(|input| (input.smooth_scroll_delta.y, input.modifiers.ctrl));
+            if scroll.abs() > 0.0 {
+                if let Some(pointer) = pointer {
+                    let (anchor_time, anchor_hz) = point_to_values(pointer);
+                    let factor = (1.0 - scroll * 0.0015).clamp(0.5, 2.0);
+                    if zoom_frequency {
+                        let new_freq_span = (freq_span * factor).clamp(100.0, nyquist);
+                        let freq_fraction = (plot.bottom() - pointer.y) / plot.height();
+                        let low = (anchor_hz - freq_fraction * new_freq_span)
+                            .clamp(0.0, (nyquist - new_freq_span).max(0.0));
+                        self.frequency_range = Some((low, low + new_freq_span));
+                    } else {
+                        let new_time_span = (time_span * factor).clamp(0.05, duration);
+                        let time_fraction = (pointer.x - plot.left()) / plot.width();
+                        let start = (anchor_time - time_fraction * new_time_span)
+                            .clamp(0.0, (duration - new_time_span).max(0.0));
+                        self.time_range = Some((start, start + new_time_span));
+                    }
+                }
+            }
+        }
+
+        let (secondary_pressed, secondary_down) = ui.input(|input| {
+            (
+                input.pointer.button_pressed(egui::PointerButton::Secondary),
+                input.pointer.button_down(egui::PointerButton::Secondary),
+            )
+        });
+        if secondary_pressed && pointer.is_some_and(|position| plot.contains(position)) {
+            if let Some(position) = pointer {
+                self.drag = Some(DragMode::Pan { last: position });
+            }
+        } else if response.drag_started_by(egui::PointerButton::Primary) {
+            if let Some(position) = pointer {
+                if (position.x - playhead_x).abs() < 8.0 {
+                    self.drag = Some(DragMode::Playhead);
+                    events.seek_to = Some(point_to_values(position).0);
+                } else if let Some(selected) = selected_id
+                    .and_then(|id| selections.iter().find(|selection| selection.id == id))
+                {
+                    let x0 = time_to_x(selected.time_start);
+                    let x1 = time_to_x(selected.time_end);
+                    let y0 = hz_to_y(selected.freq_high);
+                    let y1 = hz_to_y(selected.freq_low);
+                    let corner = [
+                        (egui::pos2(x0, y0), ResizeCorner::TopLeft),
+                        (egui::pos2(x1, y0), ResizeCorner::TopRight),
+                        (egui::pos2(x0, y1), ResizeCorner::BottomLeft),
+                        (egui::pos2(x1, y1), ResizeCorner::BottomRight),
+                    ]
+                    .into_iter()
+                    .find(|(handle, _)| handle.distance(position) <= 9.0)
+                    .map(|(_, corner)| corner);
+                    if let Some(corner) = corner {
+                        events.selected = Some(Some(selected.id));
+                        self.drag = Some(DragMode::Resize {
+                            id: selected.id,
+                            corner,
+                            last: position,
+                        });
+                    } else {
+                        let inside_selected = position.x >= x0
+                            && position.x <= time_to_x(selected.time_end)
+                            && position.y >= y0
+                            && position.y <= y1;
+                        if inside_selected {
+                            events.selected = Some(Some(selected.id));
+                            self.drag = Some(DragMode::Move {
+                                id: selected.id,
+                                last: position,
+                            });
+                        } else {
+                            self.drag = Some(DragMode::Create(position));
+                        }
+                    }
+                } else if let Some(selection) = selections.iter().rev().find(|selection| {
+                    position.x >= time_to_x(selection.time_start)
+                        && position.x <= time_to_x(selection.time_end)
+                        && position.y >= hz_to_y(selection.freq_high)
+                        && position.y <= hz_to_y(selection.freq_low)
+                }) {
+                    events.selected = Some(Some(selection.id));
+                    self.drag = Some(DragMode::Move {
+                        id: selection.id,
+                        last: position,
+                    });
+                } else {
+                    self.drag = Some(DragMode::Create(position));
+                }
+            }
+        }
+
+        if secondary_down {
+            if let (Some(DragMode::Pan { last }), Some(position)) = (self.drag, pointer) {
+                let dt = -(position.x - last.x) / plot.width() * time_span;
+                let df = (position.y - last.y) / plot.height() * freq_span;
+                let new_start = (time_start + dt).clamp(0.0, (duration - time_span).max(0.0));
+                let new_low = (freq_low + df).clamp(0.0, (nyquist - freq_span).max(0.0));
+                self.time_range = Some((new_start, new_start + time_span));
+                self.frequency_range = Some((new_low, new_low + freq_span));
+                self.drag = Some(DragMode::Pan { last: position });
+            }
+        } else if response.dragged_by(egui::PointerButton::Primary) {
+            if let Some(position) = pointer {
+                match self.drag {
+                    Some(DragMode::Playhead) => events.seek_to = Some(point_to_values(position).0),
+                    Some(DragMode::Move { id, last }) => {
+                        let dt = (position.x - last.x) / plot.width() * time_span;
+                        let df = -(position.y - last.y) / plot.height() * freq_span;
+                        if let Some(selection) = selections.iter_mut().find(|s| s.id == id) {
+                            let time_delta =
+                                dt.clamp(-selection.time_start, duration - selection.time_end);
+                            let frequency_delta =
+                                df.clamp(-selection.freq_low, nyquist - selection.freq_high);
+                            selection.time_start += time_delta;
+                            selection.time_end += time_delta;
+                            selection.freq_low += frequency_delta;
+                            selection.freq_high += frequency_delta;
+                            events.selections_changed = time_delta != 0.0 || frequency_delta != 0.0;
+                        }
+                        self.drag = Some(DragMode::Move { id, last: position });
+                    }
+                    Some(DragMode::Resize { id, corner, last }) => {
+                        let delta_time = (position.x - last.x) / plot.width() * time_span;
+                        let delta_frequency = -(position.y - last.y) / plot.height() * freq_span;
+                        if let Some(selection) = selections.iter_mut().find(|s| s.id == id) {
+                            match corner {
+                                ResizeCorner::TopLeft | ResizeCorner::BottomLeft => {
+                                    let minimum = (selection.time_end - 0.001).max(0.0);
+                                    selection.time_start =
+                                        (selection.time_start + delta_time).clamp(0.0, minimum);
+                                }
+                                ResizeCorner::TopRight | ResizeCorner::BottomRight => {
+                                    let minimum = (selection.time_start + 0.001).min(duration);
+                                    selection.time_end =
+                                        (selection.time_end + delta_time).clamp(minimum, duration);
+                                }
+                            }
+                            match corner {
+                                ResizeCorner::TopLeft | ResizeCorner::TopRight => {
+                                    let minimum = (selection.freq_low + 1.0).min(nyquist);
+                                    selection.freq_high = (selection.freq_high + delta_frequency)
+                                        .clamp(minimum, nyquist);
+                                }
+                                ResizeCorner::BottomLeft | ResizeCorner::BottomRight => {
+                                    let maximum = (selection.freq_high - 1.0).max(0.0);
+                                    selection.freq_low =
+                                        (selection.freq_low + delta_frequency).clamp(0.0, maximum);
+                                }
+                            }
+                            events.selections_changed = delta_time != 0.0 || delta_frequency != 0.0;
+                        }
+                        self.drag = Some(DragMode::Resize {
+                            id,
+                            corner,
+                            last: position,
+                        });
+                    }
+                    Some(DragMode::Create(start)) => {
+                        ui.painter().rect_stroke(
+                            egui::Rect::from_two_pos(start, position),
+                            0.0,
+                            egui::Stroke::new(1.5_f32, egui::Color32::YELLOW),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let secondary_released = ui.input(|input| {
+            input
+                .pointer
+                .button_released(egui::PointerButton::Secondary)
+        });
+        if response.drag_stopped() || secondary_released {
+            if let (Some(DragMode::Create(start)), Some(end)) = (self.drag, pointer) {
+                if (start.x - end.x).abs() > 4.0 && (start.y - end.y).abs() > 4.0 {
+                    let (t1, f1) = point_to_values(start);
+                    let (t2, f2) = point_to_values(end);
+                    let full_band = ((start.y - plot.top()).abs() < 5.0
+                        && (end.y - plot.bottom()).abs() < 5.0)
+                        || ((end.y - plot.top()).abs() < 5.0
+                            && (start.y - plot.bottom()).abs() < 5.0);
+                    events.created =
+                        Some((t1.min(t2), t1.max(t2), f1.min(f2), f1.max(f2), full_band));
+                }
+            }
+            self.drag = None;
+        }
+
+        if response.secondary_clicked() {
+            events.deleted = pointer.and_then(|position| {
                 selections
                     .iter()
                     .rev()
                     .find(|selection| {
-                        let left = rect.left()
-                            + rect.width() * (selection.time_start / duration).clamp(0.0, 1.0);
-                        let right = rect.left()
-                            + rect.width() * (selection.time_end / duration).clamp(0.0, 1.0);
-                        let top = rect.bottom()
-                            - rect.height()
-                                * (selection.freq_high / nyquist.max(1.0)).clamp(0.0, 1.0);
-                        let bottom = rect.bottom()
-                            - rect.height()
-                                * (selection.freq_low / nyquist.max(1.0)).clamp(0.0, 1.0);
-                        point.x >= left && point.x <= right && point.y >= top && point.y <= bottom
+                        position.x >= time_to_x(selection.time_start)
+                            && position.x <= time_to_x(selection.time_end)
+                            && position.y >= hz_to_y(selection.freq_high)
+                            && position.y <= hz_to_y(selection.freq_low)
                     })
                     .map(|selection| selection.id)
-            })
-        } else {
-            None
-        };
+            });
+        }
 
         let _ = spectrogram;
-        ViewEvents { created, deleted }
+        events
+    }
+}
+
+fn format_time(time: f32) -> String {
+    let seconds = time.max(0.0) as u32;
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+fn format_frequency(hz: f32) -> String {
+    if hz >= 1000.0 {
+        format!("{:.1}k", hz / 1000.0)
+    } else {
+        format!("{hz:.0}")
     }
 }
 
@@ -174,7 +467,6 @@ pub fn color_image(spectrogram: &Spectrogram) -> egui::ColorImage {
 }
 
 fn viridis(value: f32) -> egui::Color32 {
-    // Compact approximation of the Viridis perceptual palette.
     let stops = [
         (0.0, [68, 1, 84]),
         (0.25, [59, 82, 139]),
