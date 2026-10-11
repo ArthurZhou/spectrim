@@ -1,0 +1,12 @@
+[package]
+name = "spectrim"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.33"
+rfd = "0.15"
+rustfft = "6.4"
+rodio = "0.21"
+hound = "3.5"
+symphonia = { version = "0.5", features = ["wav", "mp3", "flac", "ogg", "vorbis", "pcm"] }
