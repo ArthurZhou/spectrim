@@ -23,6 +23,8 @@ use crate::ui::spectrogram_view::SpectrogramView;
 /// instead, then do one incremental render.
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(60);
 const MAX_SPECTROGRAM_CELLS: usize = 8 * 1024 * 1024;
+const MAX_DETAIL_SPECTROGRAM_CELLS: usize = 4 * 1024 * 1024;
+const MAX_DETAIL_VIEW_SECONDS: f32 = 60.0;
 type LoadedPayload = (
     PathBuf,
     Arc<AudioData>,
@@ -32,12 +34,30 @@ type LoadedPayload = (
 );
 
 fn spectrogram_hop(frames: usize, n_fft: usize) -> usize {
+    spectrogram_hop_with_budget(frames, n_fft, MAX_SPECTROGRAM_CELLS)
+}
+
+fn spectrogram_hop_with_budget(frames: usize, n_fft: usize, cell_budget: usize) -> usize {
     let n_freq = n_fft / 2 + 1;
     let minimum_hop = frames
         .saturating_mul(n_freq)
-        .div_ceil(MAX_SPECTROGRAM_CELLS)
+        .div_ceil(cell_budget.max(1))
         .max(512);
     minimum_hop.div_ceil(512).saturating_mul(512)
+}
+
+#[cfg(test)]
+mod display_fft_tests {
+    use super::*;
+
+    #[test]
+    fn detail_fft_hop_keeps_long_view_within_cell_budget() {
+        let frames = 44_100 * 60;
+        let hop = spectrogram_hop_with_budget(frames, 4096, MAX_DETAIL_SPECTROGRAM_CELLS);
+        let columns = (frames - 4096) / hop + 1;
+        assert!(columns * (4096 / 2 + 1) <= MAX_DETAIL_SPECTROGRAM_CELLS);
+        assert_eq!(hop % 512, 0);
+    }
 }
 
 /// The decoded track plus its analysis.
@@ -381,8 +401,13 @@ impl SpectrimApp {
                         let last = ((time_range.1.max(0.0) * sample_rate as f32).ceil() as usize)
                             .saturating_add(padding)
                             .min(total_frames);
+                        let hop = spectrogram_hop_with_budget(
+                            last.saturating_sub(first),
+                            n_fft,
+                            MAX_DETAIL_SPECTROGRAM_CELLS,
+                        );
+                        let last = last.saturating_add(hop).min(total_frames);
                         let crop = &samples[first * channel_count..last * channel_count];
-                        let hop = spectrogram_hop(last.saturating_sub(first), n_fft);
                         let detail = spectrogram::compute_interleaved(
                             crop,
                             channels,
@@ -390,10 +415,12 @@ impl SpectrimApp {
                             n_fft,
                             hop,
                         );
+                        let detail_end =
+                            (first + detail.n_time.saturating_sub(1) * hop + n_fft / 2).min(last);
                         let _ = spectrogram_msg_tx.send(WorkerMessage::ViewDetailReady(
                             revision,
-                            first as f32 / sample_rate as f32,
-                            last as f32 / sample_rate as f32,
+                            (first + n_fft / 2) as f32 / sample_rate as f32,
+                            detail_end as f32 / sample_rate as f32,
                             detail,
                         ));
                     }
@@ -694,14 +721,21 @@ impl SpectrimApp {
                 WorkerMessage::ViewDetailReady(revision, time_start, time_end, detail) => {
                     if revision == self.detail_revision {
                         self.detail_in_flight = false;
-                        let image = crate::ui::spectrogram_view::color_image(&detail);
-                        let texture = ctx.load_texture(
-                            "spectrogram-detail",
-                            image,
-                            egui::TextureOptions::LINEAR,
-                        );
-                        self.spectrogram_view
-                            .set_detail(texture, time_start, time_end);
+                        if let Some(loaded) = &self.loaded {
+                            let image = crate::ui::spectrogram_view::color_image_with_range(
+                                &detail,
+                                loaded.spectrogram.db_min,
+                                loaded.spectrogram.db_max,
+                                loaded.spectrogram.n_fft,
+                            );
+                            let texture = ctx.load_texture(
+                                "spectrogram-detail",
+                                image,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.spectrogram_view
+                                .set_detail(texture, time_start, time_end);
+                        }
                     }
                 }
                 WorkerMessage::ExportDone(result) => {
@@ -942,12 +976,14 @@ impl SpectrimApp {
         self.detail_revision = self.detail_revision.wrapping_add(1);
         self.detail_in_flight = false;
         self.spectrogram_view.clear_detail();
-        if self.visible_time_range.1 > self.visible_time_range.0 {
-            self.fft_zoom_target = Some((
-                self.fft_size.max(4096),
-                self.visible_time_range,
-                Instant::now(),
-            ));
+        let refine_visible = self.loaded.as_ref().is_some_and(|loaded| {
+            let time_span = self.visible_time_range.1 - self.visible_time_range.0;
+            time_span > 0.0
+                && time_span <= MAX_DETAIL_VIEW_SECONDS
+                && time_span < loaded.audio.duration * 0.75
+        });
+        if refine_visible {
+            self.fft_zoom_target = Some((4096, self.visible_time_range, Instant::now()));
         }
     }
 
@@ -1110,9 +1146,9 @@ impl eframe::App for SpectrimApp {
                         loaded.audio.duration, loaded.audio.sample_rate, loaded.audio.channels
                     ));
                     if let Some((time, frequency)) = self.pointer_coordinates {
-                            ui.label(format!("· {time:.3}s · {frequency:.1} Hz"));
+                        ui.label(format!("· {time:.3}s · {frequency:.1} Hz"));
                     } else {
-                            ui.label("· —");
+                        ui.label("· —");
                     }
                 });
                 let events = self.spectrogram_view.show(
@@ -1127,42 +1163,19 @@ impl eframe::App for SpectrimApp {
                 );
                 let visible_frequency_span = events.visible_ranges.3 - events.visible_ranges.2;
                 self.visible_time_range = (events.visible_ranges.0, events.visible_ranges.1);
-                let visible_time_span = events.visible_ranges.1 - events.visible_ranges.0;
-                let is_zoomed = visible_time_span < loaded.audio.duration * 0.75
-                    || visible_frequency_span < loaded.audio.sample_rate as f32 * 0.4;
-                let detail_time_range = if visible_time_span <= 120.0 {
-                    (events.visible_ranges.0, events.visible_ranges.1)
-                } else {
-                    let visible_center = if current_time >= events.visible_ranges.0
-                        && current_time <= events.visible_ranges.1
-                    {
-                        current_time
-                    } else {
-                        (events.visible_ranges.0 + events.visible_ranges.1) * 0.5
-                    };
-                    (
-                        (visible_center - 60.0).max(events.visible_ranges.0),
-                        (visible_center + 60.0).min(events.visible_ranges.1),
-                    )
-                };
-                let suggested_fft = if visible_frequency_span <= 2_800.0 {
-                    8_192
-                } else if visible_frequency_span <= 5_600.0 {
-                    4_096
-                } else {
-                    2_048
-                };
-                if events.view_changed && is_zoomed {
+                if events.view_changed {
                     self.detail_revision = self.detail_revision.wrapping_add(1);
                     self.detail_in_flight = false;
                     self.spectrogram_view.clear_detail();
-                    let target = (suggested_fft, detail_time_range);
-                    self.fft_zoom_target = Some((target.0, target.1, Instant::now()));
-                } else if !is_zoomed {
-                    self.fft_zoom_target = None;
-                    self.detail_revision = self.detail_revision.wrapping_add(1);
-                    self.detail_in_flight = false;
-                    self.spectrogram_view.clear_detail();
+                    let visible_time_span = events.visible_ranges.1 - events.visible_ranges.0;
+                    let should_refine = visible_time_span <= MAX_DETAIL_VIEW_SECONDS
+                        && (visible_time_span < loaded.audio.duration * 0.75
+                            || visible_frequency_span < loaded.audio.sample_rate as f32 * 0.4);
+                    self.fft_zoom_target = should_refine.then_some((
+                        4096,
+                        (events.visible_ranges.0, events.visible_ranges.1),
+                        Instant::now(),
+                    ));
                 }
                 if let Some(selected) = events.selected {
                     self.selected_selection = selected;
@@ -1230,17 +1243,17 @@ impl eframe::App for SpectrimApp {
 
         if self.export_dialog_open {
             let modal = egui::Modal::new(egui::Id::new("export_options_modal")).show(ctx, |ui| {
-                    ui.set_min_width(300.0);
-                    ui.heading("Export WAV");
-                    ui.checkbox(&mut self.export_crop_silence, "裁剪处理后音频的首尾静音");
-                    ui.label("静音阈值：-60 dBFS。其他导出选项可在此继续添加。");
-                    ui.horizontal(|ui| {
-                        let confirm = ui.button("选择路径并导出…").clicked();
-                        let cancel = ui.button("取消").clicked();
-                        (confirm, cancel)
-                    })
-                    .inner
-                });
+                ui.set_min_width(300.0);
+                ui.heading("Export WAV");
+                ui.checkbox(&mut self.export_crop_silence, "裁剪处理后音频的首尾静音");
+                ui.label("静音阈值：-60 dBFS。其他导出选项可在此继续添加。");
+                ui.horizontal(|ui| {
+                    let confirm = ui.button("选择路径并导出…").clicked();
+                    let cancel = ui.button("取消").clicked();
+                    (confirm, cancel)
+                })
+                .inner
+            });
             let (confirm, cancel) = modal.inner;
             if cancel || modal.should_close() {
                 self.export_dialog_open = false;

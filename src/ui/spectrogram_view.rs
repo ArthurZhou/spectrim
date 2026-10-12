@@ -540,9 +540,6 @@ impl SpectrogramView {
         if let Some(position) = hover_pointer {
             let (time, hz) = point_to_values(position);
             events.pointer_coordinates = Some((time, hz));
-            response
-                .clone()
-                .on_hover_text(format!("Time: {:.3} s\nFrequency: {:.1} Hz", time, hz));
             // Advertise that the playhead can be grabbed, and do so on the
             // unclamped position so the plot edges stay free for creating
             // regions.
@@ -1124,24 +1121,55 @@ fn draw_polygon_fill(painter: &egui::Painter, points: &[egui::Pos2], color: egui
 }
 
 pub fn color_image(spectrogram: &Spectrogram) -> egui::ColorImage {
-    color_image_inner(spectrogram, None).expect("non-cancellable image conversion returns a result")
+    color_image_inner(
+        spectrogram,
+        spectrogram.db_min,
+        spectrogram.db_max,
+        spectrogram.n_fft,
+        None,
+    )
+    .expect("non-cancellable image conversion returns a result")
+}
+
+pub fn color_image_with_range(
+    spectrogram: &Spectrogram,
+    db_min: f32,
+    db_max: f32,
+    reference_fft: usize,
+) -> egui::ColorImage {
+    color_image_inner(spectrogram, db_min, db_max, reference_fft, None)
+        .expect("non-cancellable image conversion returns a result")
 }
 
 pub fn color_image_cancellable(
     spectrogram: &Spectrogram,
     cancelled: &AtomicBool,
 ) -> Option<egui::ColorImage> {
-    color_image_inner(spectrogram, Some(cancelled))
+    color_image_inner(
+        spectrogram,
+        spectrogram.db_min,
+        spectrogram.db_max,
+        spectrogram.n_fft,
+        Some(cancelled),
+    )
 }
 
 fn color_image_inner(
     spectrogram: &Spectrogram,
+    db_min: f32,
+    db_max: f32,
+    reference_fft: usize,
     cancelled: Option<&AtomicBool>,
 ) -> Option<egui::ColorImage> {
     let max_width = 8192usize;
     let width = spectrogram.n_time.min(max_width).max(1);
     let height = spectrogram.n_freq.max(1);
-    let range = (spectrogram.db_max - spectrogram.db_min).max(1.0e-6);
+    let range = (db_max - db_min).max(1.0e-6);
+    let magnitude_offset = if spectrogram.n_fft > 0 && reference_fft > 0 {
+        20.0 * (reference_fft as f32 / spectrogram.n_fft as f32).log10()
+    } else {
+        0.0
+    };
     let time_ranges: Vec<(usize, usize)> = (0..width)
         .map(|x| {
             let start = x * spectrogram.n_time / width;
@@ -1172,7 +1200,8 @@ fn color_image_inner(
                         *pixel = egui::Color32::BLACK;
                     } else {
                         let value = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                        *pixel = viridis(((value - spectrogram.db_min) / range).clamp(0.0, 1.0));
+                        *pixel =
+                            viridis(((value + magnitude_offset - db_min) / range).clamp(0.0, 1.0));
                     }
                 }
             }

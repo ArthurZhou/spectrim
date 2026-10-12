@@ -30,7 +30,7 @@ use rayon::prelude::*;
 
 use super::iir;
 use super::process::apply_spectral_masks;
-use super::types::{AudioData, Selection, SelectionAction, SelectionShape};
+use super::types::{AudioData, Selection, SelectionAction};
 
 /// What a render call produced.
 #[derive(Debug)]
@@ -450,21 +450,6 @@ impl PreviewCache {
                 build_band_signals(audio, selections)
             };
             self.samples = render_full(audio, selections);
-            return PreviewOutcome {
-                changed_frames: Some((0, frames)),
-                full_rebuild: true,
-            };
-        }
-
-        // Keep polygon previews on the same exact STFT path as export. The
-        // IIR cache represents a band rectangle and cannot follow polygon edges.
-        if selections.iter().any(Selection::is_polygon)
-            || self.selections.iter().any(Selection::is_polygon)
-        {
-            self.samples = render_full(audio, selections);
-            self.selections = selections.to_vec();
-            self.band_signals.clear();
-            self.audio_signature = signature;
             return PreviewOutcome {
                 changed_frames: Some((0, frames)),
                 full_rebuild: true,
