@@ -1,8 +1,9 @@
 use eframe::egui;
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::audio::spectrogram::SpectrogramPatch;
-use crate::audio::types::{AudioData, Selection, SelectionAction, Spectrogram};
+use crate::audio::types::{AudioData, Selection, SelectionAction, SelectionShape, Spectrogram};
 
 /// Half-width of the playhead notch triangle. Doubles as its grab radius, so
 /// the visual affordance and the hit area always agree.
@@ -18,6 +19,15 @@ pub struct SpectrogramView {
     drag: Option<DragMode>,
     time_range: Option<(f32, f32)>,
     frequency_range: Option<(f32, f32)>,
+    detail: Option<DetailTexture>,
+    polygon_tool: bool,
+    polygon_points: Vec<(f32, f32)>,
+}
+
+struct DetailTexture {
+    texture: egui::TextureHandle,
+    time_start: f32,
+    time_end: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -35,6 +45,10 @@ enum DragMode {
     Playhead,
     Pan {
         last: egui::Pos2,
+    },
+    PolygonVertex {
+        id: u64,
+        index: usize,
     },
 }
 
@@ -54,9 +68,33 @@ pub struct ViewEvents {
     pub selections_changed: bool,
     pub drag_started: bool,
     pub drag_stopped: bool,
+    pub pointer_coordinates: Option<(f32, f32)>,
+    pub visible_ranges: (f32, f32, f32, f32),
+    pub view_changed: bool,
+    pub created_polygon: Option<Vec<(f32, f32)>>,
 }
 
 impl SpectrogramView {
+    pub fn set_detail(&mut self, texture: egui::TextureHandle, time_start: f32, time_end: f32) {
+        self.detail = Some(DetailTexture {
+            texture,
+            time_start,
+            time_end,
+        });
+    }
+
+    pub fn clear_detail(&mut self) {
+        self.detail = None;
+    }
+
+    pub fn set_polygon_tool(&mut self, active: bool) {
+        if self.polygon_tool != active {
+            self.polygon_tool = active;
+            self.polygon_points.clear();
+            self.drag = None;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
@@ -67,6 +105,7 @@ impl SpectrogramView {
         selections: &mut [Selection],
         selected_id: Option<u64>,
         playhead: f32,
+        polygon_tool: bool,
     ) -> ViewEvents {
         let outer = ui.available_rect_before_wrap();
         let plot = egui::Rect::from_min_max(
@@ -82,6 +121,7 @@ impl SpectrogramView {
 
         let duration = audio.duration.max(0.001);
         let nyquist = (audio.sample_rate as f32 * 0.5).max(1.0);
+        self.set_polygon_tool(polygon_tool);
         let (time_start, time_end) = self.time_range.unwrap_or((0.0, duration));
         let (freq_low, freq_high) = self.frequency_range.unwrap_or((0.0, nyquist));
         let time_span = (time_end - time_start).max(0.001);
@@ -104,6 +144,29 @@ impl SpectrogramView {
             );
             ui.painter()
                 .image(texture.id(), plot, uv, egui::Color32::WHITE);
+        }
+        if let Some(detail) = &self.detail {
+            let visible_start = time_start.max(detail.time_start);
+            let visible_end = time_end.min(detail.time_end);
+            if visible_end > visible_start {
+                let target = egui::Rect::from_min_max(
+                    egui::pos2(time_to_x(visible_start), plot.top()),
+                    egui::pos2(time_to_x(visible_end), plot.bottom()),
+                );
+                let local_duration = (detail.time_end - detail.time_start).max(f32::EPSILON);
+                let uv = egui::Rect::from_min_max(
+                    egui::pos2(
+                        (visible_start - detail.time_start) / local_duration,
+                        1.0 - freq_high / nyquist,
+                    ),
+                    egui::pos2(
+                        (visible_end - detail.time_start) / local_duration,
+                        1.0 - freq_low / nyquist,
+                    ),
+                );
+                ui.painter()
+                    .image(detail.texture.id(), target, uv, egui::Color32::WHITE);
+            }
         }
 
         let mut shapes = Vec::new();
@@ -143,17 +206,74 @@ impl SpectrogramView {
         ui.painter().extend(shapes);
 
         for selection in selections.iter() {
+            let selection_alpha = if selection.enabled { 1.0 } else { 0.35 };
+            if let SelectionShape::Polygon { points } = &selection.shape {
+                let screen_points = points
+                    .iter()
+                    .map(|(time, hz)| egui::pos2(time_to_x(*time), hz_to_y(*hz)))
+                    .collect::<Vec<_>>();
+                let color = match selection.action {
+                    SelectionAction::Solo => egui::Color32::from_rgb(40, 190, 185),
+                    SelectionAction::Gain => egui::Color32::from_rgb(250, 170, 50),
+                };
+                draw_polygon_fill(
+                    ui.painter(),
+                    &screen_points,
+                    color.gamma_multiply(selection_alpha),
+                );
+                let stroke = egui::Stroke::new(
+                    if selected_id == Some(selection.id) {
+                        2.5
+                    } else {
+                        1.5
+                    },
+                    color.gamma_multiply(selection_alpha),
+                );
+                if screen_points.len() >= 2 {
+                    for pair in screen_points.windows(2) {
+                        ui.painter().line_segment([pair[0], pair[1]], stroke);
+                    }
+                    if let (Some(first), Some(last)) = (screen_points.first(), screen_points.last())
+                    {
+                        ui.painter().line_segment([*last, *first], stroke);
+                    }
+                }
+                for (index, point) in screen_points.iter().enumerate() {
+                    ui.painter().circle_filled(
+                        *point,
+                        if index == 0 { 5.0 } else { 3.5 },
+                        if index == 0 {
+                            egui::Color32::WHITE
+                        } else {
+                            stroke.color
+                        },
+                    );
+                    if selected_id == Some(selection.id) {
+                        ui.painter().circle_stroke(
+                            *point,
+                            7.0,
+                            egui::Stroke::new(1.0, egui::Color32::WHITE),
+                        );
+                    }
+                }
+                continue;
+            }
             let left = time_to_x(selection.time_start).clamp(plot.left(), plot.right());
             let right = time_to_x(selection.time_end).clamp(plot.left(), plot.right());
-            let top = hz_to_y(selection.freq_high).clamp(plot.top(), plot.bottom());
-            let bottom = hz_to_y(selection.freq_low).clamp(plot.top(), plot.bottom());
+            let (selection_low, selection_high) = if selection.full_band {
+                (0.0, nyquist)
+            } else {
+                (selection.freq_low, selection.freq_high)
+            };
+            let top = hz_to_y(selection_high).clamp(plot.top(), plot.bottom());
+            let bottom = hz_to_y(selection_low).clamp(plot.top(), plot.bottom());
             let rect = egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom));
             let color = match selection.action {
                 SelectionAction::Solo => egui::Color32::from_rgb(40, 190, 185),
                 SelectionAction::Gain => egui::Color32::from_rgb(250, 170, 50),
             };
             ui.painter()
-                .rect_filled(rect, 0.0, color.gamma_multiply(0.25));
+                .rect_filled(rect, 0.0, color.gamma_multiply(0.25 * selection_alpha));
             ui.painter().rect_stroke(
                 rect,
                 0.0,
@@ -163,7 +283,7 @@ impl SpectrogramView {
                     } else {
                         1.5_f32
                     },
-                    color,
+                    color.gamma_multiply(selection_alpha),
                 ),
                 egui::StrokeKind::Inside,
             );
@@ -278,101 +398,271 @@ impl SpectrogramView {
             selections_changed: false,
             drag_started: false,
             drag_stopped: false,
+            pointer_coordinates: None,
+            visible_ranges: (time_start, time_end, freq_low, freq_high),
+            view_changed: false,
+            created_polygon: None,
         };
 
-        let pointer = response.interact_pointer_pos();
-        if response.hovered() || response.dragged() {
-            if let Some(position) = pointer {
-                let (time, hz) = point_to_values(position);
-                response
-                    .clone()
-                    .on_hover_text(format!("Time: {:.3} s\nFrequency: {:.1} Hz", time, hz));
-                // Advertise that the playhead can be grabbed, and do so on the
-                // unclamped position so the plot edges stay free for creating
-                // regions.
-                if dragging_playhead
-                    || (playhead_in_view
-                        && (position.x - playhead_raw_x).abs()
-                            <= PLAYHEAD_GRAB_X + PLAYHEAD_HIT_SLACK)
-                {
-                    ui.ctx()
-                        .output_mut(|output| output.cursor_icon = egui::CursorIcon::ResizeColumn);
-                }
-            }
-        }
-
-        // Use the raw wheel delta and test the plot's actual hover position.
-        // `response.hovered()` can be false when another overlapping egui
-        // response (for example the enclosing panel) owns the pointer event.
-        if let Some(pointer) = ui
+        let hover_pointer = ui
             .input(|input| input.pointer.hover_pos())
-            .filter(|position| plot.contains(*position))
-        {
-            let scroll_y = ui.input(|input| input.raw_scroll_delta.y);
-            if scroll_y.abs() > f32::EPSILON {
-                let (anchor_time, anchor_hz) = point_to_values(pointer);
-                // Wheel up zooms in; wheel down zooms out. Exponential scaling
-                // behaves consistently for both mouse wheels and touchpads.
-                let scale = (-scroll_y * 0.003).exp().clamp(0.5, 2.0);
-                let zoom_frequency = ui.input(|input| input.modifiers.ctrl);
-                if zoom_frequency {
-                    let new_span = (freq_span * scale).clamp(100.0_f32.min(nyquist), nyquist);
-                    let fraction = ((plot.bottom() - pointer.y) / plot.height()).clamp(0.0, 1.0);
-                    let low =
-                        (anchor_hz - fraction * new_span).clamp(0.0, (nyquist - new_span).max(0.0));
-                    self.frequency_range = Some((low, low + new_span));
-                } else {
-                    let new_span = (time_span * scale).clamp(0.05_f32.min(duration), duration);
-                    let fraction = ((pointer.x - plot.left()) / plot.width()).clamp(0.0, 1.0);
-                    let start = (anchor_time - fraction * new_span)
-                        .clamp(0.0, (duration - new_span).max(0.0));
-                    self.time_range = Some((start, start + new_span));
+            .filter(|p| plot.contains(*p));
+        if self.polygon_tool {
+            if !self.polygon_points.is_empty() {
+                let screen_points = self
+                    .polygon_points
+                    .iter()
+                    .map(|(time, hz)| egui::pos2(time_to_x(*time), hz_to_y(*hz)))
+                    .collect::<Vec<_>>();
+                for pair in screen_points.windows(2) {
+                    ui.painter().line_segment(
+                        [pair[0], pair[1]],
+                        egui::Stroke::new(2.0, egui::Color32::YELLOW),
+                    );
                 }
-                ui.ctx().request_repaint();
+                for (index, point) in screen_points.iter().enumerate() {
+                    ui.painter().circle_filled(
+                        *point,
+                        if index == 0 { 6.0 } else { 4.0 },
+                        if index == 0 {
+                            egui::Color32::WHITE
+                        } else {
+                            egui::Color32::YELLOW
+                        },
+                    );
+                }
+                if let (Some(cursor), Some(last)) = (hover_pointer, screen_points.last()) {
+                    let near_first = screen_points
+                        .first()
+                        .is_some_and(|first| cursor.distance(*first) <= 10.0)
+                        && screen_points.len() >= 3;
+                    draw_dashed_line(
+                        ui.painter(),
+                        *last,
+                        cursor,
+                        if near_first {
+                            egui::Color32::GREEN
+                        } else {
+                            egui::Color32::YELLOW
+                        },
+                    );
+                }
+            }
+
+            // Use the raw wheel delta and test the plot's actual hover position.
+            // `response.hovered()` can be false when another overlapping egui
+            // response (for example the enclosing panel) owns the pointer event.
+            if let Some(pointer) = ui
+                .input(|input| input.pointer.hover_pos())
+                .filter(|position| plot.contains(*position))
+            {
+                let scroll_y = ui.input(|input| input.raw_scroll_delta.y);
+                if scroll_y.abs() > f32::EPSILON {
+                    let (anchor_time, anchor_hz) = point_to_values(pointer);
+                    // Wheel up zooms in; wheel down zooms out. Exponential scaling
+                    // behaves consistently for both mouse wheels and touchpads.
+                    let scale = (-scroll_y * 0.003).exp().clamp(0.5, 2.0);
+                    let zoom_frequency = ui.input(|input| input.modifiers.ctrl);
+                    if zoom_frequency {
+                        let new_span = (freq_span * scale).clamp(100.0_f32.min(nyquist), nyquist);
+                        let fraction =
+                            ((plot.bottom() - pointer.y) / plot.height()).clamp(0.0, 1.0);
+                        let low = (anchor_hz - fraction * new_span)
+                            .clamp(0.0, (nyquist - new_span).max(0.0));
+                        self.frequency_range = Some((low, low + new_span));
+                    } else {
+                        let new_span = (time_span * scale).clamp(0.05_f32.min(duration), duration);
+                        let fraction = ((pointer.x - plot.left()) / plot.width()).clamp(0.0, 1.0);
+                        let start = (anchor_time - fraction * new_span)
+                            .clamp(0.0, (duration - new_span).max(0.0));
+                        self.time_range = Some((start, start + new_span));
+                    }
+                    events.view_changed = true;
+                    ui.ctx().request_repaint();
+                }
+            }
+
+            let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
+            let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
+            let right_clicked = response.clicked_by(egui::PointerButton::Secondary);
+            if escape || right_clicked {
+                self.polygon_points.clear();
+            } else {
+                let double_clicked = response.double_clicked_by(egui::PointerButton::Primary);
+                let clicked = response.clicked_by(egui::PointerButton::Primary);
+                let close_near_first = clicked
+                    && self.polygon_points.len() >= 3
+                    && hover_pointer.is_some_and(|cursor| {
+                        let first = egui::pos2(
+                            time_to_x(self.polygon_points[0].0),
+                            hz_to_y(self.polygon_points[0].1),
+                        );
+                        cursor.distance(first) <= 10.0
+                    });
+                if double_clicked && self.polygon_points.len() == 2 {
+                    if let Some(position) = hover_pointer {
+                        let point = point_to_values(position);
+                        let duplicate = self.polygon_points.last().is_some_and(|previous| {
+                            let dx = (point.0 - previous.0) * plot.width() / time_span;
+                            let dy = (point.1 - previous.1) * plot.height() / freq_span;
+                            dx.hypot(dy) < 3.0
+                        });
+                        if !duplicate {
+                            self.polygon_points.push(point);
+                        }
+                    }
+                }
+                if enter || double_clicked || close_near_first {
+                    if self.polygon_points.len() >= 3
+                        && polygon_area_pixels(&self.polygon_points, &time_to_x, &hz_to_y) >= 16.0
+                    {
+                        events.created_polygon = Some(std::mem::take(&mut self.polygon_points));
+                    } else if double_clicked || enter {
+                        self.polygon_points.clear();
+                    }
+                } else if clicked {
+                    if let Some(position) = hover_pointer {
+                        let point = point_to_values(position);
+                        let duplicate = self.polygon_points.iter().any(|previous| {
+                            let dx = (point.0 - previous.0) * plot.width() / time_span;
+                            let dy = (point.1 - previous.1) * plot.height() / freq_span;
+                            dx.hypot(dy) < 3.0
+                        });
+                        if !duplicate {
+                            self.polygon_points.push(point);
+                        }
+                    }
+                }
             }
         }
 
-        // Pan the visible time/frequency window with right-button drag. Read
-        // raw pointer state because this plot response is configured for the
-        // primary-button region gestures only.
-        let (secondary_pointer, secondary_pressed, secondary_down, secondary_released) =
-            ui.input(|input| {
-                (
-                    input.pointer.hover_pos(),
-                    input.pointer.button_pressed(egui::PointerButton::Secondary),
-                    input.pointer.button_down(egui::PointerButton::Secondary),
-                    input
-                        .pointer
-                        .button_released(egui::PointerButton::Secondary),
-                )
-            });
-        if secondary_pressed && secondary_pointer.is_some_and(|position| plot.contains(position)) {
-            if let Some(position) = secondary_pointer {
-                self.drag = Some(DragMode::Pan { last: position });
+        // --- Standard Interaction / Pan -------------------------------------
+        if let Some(position) = hover_pointer {
+            let (time, hz) = point_to_values(position);
+            events.pointer_coordinates = Some((time, hz));
+            response
+                .clone()
+                .on_hover_text(format!("Time: {:.3} s\nFrequency: {:.1} Hz", time, hz));
+            // Advertise that the playhead can be grabbed, and do so on the
+            // unclamped position so the plot edges stay free for creating
+            // regions.
+            if dragging_playhead
+                || (playhead_in_view
+                    && (position.x - playhead_raw_x).abs() <= PLAYHEAD_GRAB_X + PLAYHEAD_HIT_SLACK)
+            {
+                ui.ctx()
+                    .output_mut(|output| output.cursor_icon = egui::CursorIcon::ResizeColumn);
             }
         }
-        if secondary_down {
-            if let (Some(DragMode::Pan { last }), Some(position)) = (self.drag, secondary_pointer) {
-                let time_delta = -(position.x - last.x) / plot.width() * time_span;
-                let frequency_delta = (position.y - last.y) / plot.height() * freq_span;
-                let new_time_start =
-                    (time_start + time_delta).clamp(0.0, (duration - time_span).max(0.0));
-                let new_frequency_low =
-                    (freq_low + frequency_delta).clamp(0.0, (nyquist - freq_span).max(0.0));
-                self.time_range = Some((new_time_start, new_time_start + time_span));
-                self.frequency_range = Some((new_frequency_low, new_frequency_low + freq_span));
-                self.drag = Some(DragMode::Pan { last: position });
-                ui.ctx().request_repaint();
+        // Keep drag gestures alive if the pointer is released just outside the
+        // plot, while only publishing coordinate readouts for points in it.
+        let pointer = response.interact_pointer_pos();
+
+        if !self.polygon_tool {
+            // Standard zooming and panning are disabled when polygon_tool is active
+            // (as it replaces them with polygon-specific logic above).
+
+            // Use the raw wheel delta and test the plot's actual hover position.
+            if let Some(pointer) = ui
+                .input(|input| input.pointer.hover_pos())
+                .filter(|position| plot.contains(*position))
+            {
+                let scroll_y = ui.input(|input| input.raw_scroll_delta.y);
+                if scroll_y.abs() > f32::EPSILON {
+                    let (anchor_time, anchor_hz) = point_to_values(pointer);
+                    let scale = (-scroll_y * 0.003).exp().clamp(0.5, 2.0);
+                    let zoom_frequency = ui.input(|input| input.modifiers.ctrl);
+                    if zoom_frequency {
+                        let new_span = (freq_span * scale).clamp(100.0_f32.min(nyquist), nyquist);
+                        let fraction =
+                            ((plot.bottom() - pointer.y) / plot.height()).clamp(0.0, 1.0);
+                        let low = (anchor_hz - fraction * new_span)
+                            .clamp(0.0, (nyquist - new_span).max(0.0));
+                        self.frequency_range = Some((low, low + new_span));
+                    } else {
+                        let new_span = (time_span * scale).clamp(0.05_f32.min(duration), duration);
+                        let fraction = ((pointer.x - plot.left()) / plot.width()).clamp(0.0, 1.0);
+                        let start = (anchor_time - fraction * new_span)
+                            .clamp(0.0, (duration - new_span).max(0.0));
+                        self.time_range = Some((start, start + new_span));
+                    }
+                    events.view_changed = true;
+                    ui.ctx().request_repaint();
+                }
             }
-        }
-        if secondary_released && matches!(self.drag, Some(DragMode::Pan { .. })) {
-            self.drag = None;
+
+            // Pan the visible time/frequency window with right-button drag. Read
+            // raw pointer state because this plot response is configured for the
+            // primary-button region gestures only.
+            let (secondary_pointer, secondary_pressed, secondary_down, secondary_released) = ui
+                .input(|input| {
+                    (
+                        input.pointer.hover_pos(),
+                        input.pointer.button_pressed(egui::PointerButton::Secondary),
+                        input.pointer.button_down(egui::PointerButton::Secondary),
+                        input
+                            .pointer
+                            .button_released(egui::PointerButton::Secondary),
+                    )
+                });
+            if secondary_pressed
+                && secondary_pointer.is_some_and(|position| plot.contains(position))
+            {
+                if let Some(position) = secondary_pointer {
+                    self.drag = Some(DragMode::Pan { last: position });
+                }
+            }
+            if secondary_down {
+                if let (Some(DragMode::Pan { last }), Some(position)) =
+                    (self.drag, secondary_pointer)
+                {
+                    let time_delta = -(position.x - last.x) / plot.width() * time_span;
+                    let frequency_delta = (position.y - last.y) / plot.height() * freq_span;
+                    let new_time_start =
+                        (time_start + time_delta).clamp(0.0, (duration - time_span).max(0.0));
+                    let new_frequency_low =
+                        (freq_low + frequency_delta).clamp(0.0, (nyquist - freq_span).max(0.0));
+                    self.time_range = Some((new_time_start, new_time_start + time_span));
+                    self.frequency_range = Some((new_frequency_low, new_frequency_low + freq_span));
+                    events.view_changed = true;
+                    self.drag = Some(DragMode::Pan { last: position });
+                    ui.ctx().request_repaint();
+                }
+            }
+            if secondary_released && matches!(self.drag, Some(DragMode::Pan { .. })) {
+                self.drag = None;
+            }
         }
 
-        if response.drag_started_by(egui::PointerButton::Primary) {
+        if !self.polygon_tool && response.drag_started_by(egui::PointerButton::Primary) {
             if let Some(position) = pointer {
                 events.drag_started = true;
-                if playhead_in_view
+                if !self.polygon_tool {
+                    let vertex_for = |selection: &Selection| match &selection.shape {
+                        SelectionShape::Polygon { points } => points
+                            .iter()
+                            .enumerate()
+                            .map(|(index, (time, hz))| {
+                                (index, egui::pos2(time_to_x(*time), hz_to_y(*hz)))
+                            })
+                            .find(|(_, point)| point.distance(position) <= 9.0)
+                            .map(|(index, _)| (selection.id, index)),
+                        SelectionShape::Rect => None,
+                    };
+                    let vertex = selected_id
+                        .and_then(|id| selections.iter().find(|selection| selection.id == id))
+                        .and_then(vertex_for)
+                        .or_else(|| selections.iter().rev().find_map(vertex_for));
+                    if let Some((id, index)) = vertex {
+                        self.drag = Some(DragMode::PolygonVertex { id, index });
+                        events.selected = Some(Some(id));
+                    }
+                }
+                if matches!(self.drag, Some(DragMode::PolygonVertex { .. })) {
+                    // Vertex drag has priority over playhead/rectangle operations.
+                } else if self.polygon_tool {
+                    // Polygon clicks are handled by the multi-click state machine below.
+                } else if playhead_in_view
                     && (position.x - playhead_raw_x).abs() <= PLAYHEAD_GRAB_X + PLAYHEAD_HIT_SLACK
                 {
                     self.drag = Some(DragMode::Playhead);
@@ -380,61 +670,123 @@ impl SpectrogramView {
                 } else if let Some(selected) = selected_id
                     .and_then(|id| selections.iter().find(|selection| selection.id == id))
                 {
-                    let x0 = time_to_x(selected.time_start);
-                    let x1 = time_to_x(selected.time_end);
-                    let y0 = hz_to_y(selected.freq_high);
-                    let y1 = hz_to_y(selected.freq_low);
-                    let corner = [
-                        (egui::pos2(x0, y0), ResizeCorner::TopLeft),
-                        (egui::pos2(x1, y0), ResizeCorner::TopRight),
-                        (egui::pos2(x0, y1), ResizeCorner::BottomLeft),
-                        (egui::pos2(x1, y1), ResizeCorner::BottomRight),
-                    ]
-                    .into_iter()
-                    .find(|(handle, _)| handle.distance(position) <= 9.0)
-                    .map(|(_, corner)| corner);
-                    if let Some(corner) = corner {
-                        events.selected = Some(Some(selected.id));
-                        self.drag = Some(DragMode::Resize {
-                            id: selected.id,
-                            corner,
-                            last: position,
-                        });
-                    } else {
-                        let inside_selected = position.x >= x0
-                            && position.x <= time_to_x(selected.time_end)
-                            && position.y >= y0
-                            && position.y <= y1;
-                        if inside_selected {
+                    if let SelectionShape::Polygon { points } = &selected.shape {
+                        if point_in_polygon(point_to_values(position), points) {
                             events.selected = Some(Some(selected.id));
-                            self.drag = Some(DragMode::Move {
-                                id: selected.id,
-                                last: position,
-                            });
                         } else {
                             self.drag = Some(DragMode::Create(position));
                         }
+                    } else {
+                        let x0 = time_to_x(selected.time_start);
+                        let x1 = time_to_x(selected.time_end);
+                        let y0 = hz_to_y(selected.freq_high);
+                        let y1 = hz_to_y(selected.freq_low);
+                        let corner = [
+                            (egui::pos2(x0, y0), ResizeCorner::TopLeft),
+                            (egui::pos2(x1, y0), ResizeCorner::TopRight),
+                            (egui::pos2(x0, y1), ResizeCorner::BottomLeft),
+                            (egui::pos2(x1, y1), ResizeCorner::BottomRight),
+                        ]
+                        .into_iter()
+                        .find(|(handle, _)| handle.distance(position) <= 9.0)
+                        .map(|(_, corner)| corner);
+                        if let Some(corner) = corner {
+                            events.selected = Some(Some(selected.id));
+                            self.drag = Some(DragMode::Resize {
+                                id: selected.id,
+                                corner,
+                                last: position,
+                            });
+                        } else {
+                            let inside_selected = position.x >= x0
+                                && position.x <= time_to_x(selected.time_end)
+                                && position.y >= y0
+                                && position.y <= y1;
+                            if inside_selected {
+                                events.selected = Some(Some(selected.id));
+                                self.drag = Some(DragMode::Move {
+                                    id: selected.id,
+                                    last: position,
+                                });
+                            } else {
+                                self.drag = Some(DragMode::Create(position));
+                            }
+                        }
                     }
-                } else if let Some(selection) = selections.iter().rev().find(|selection| {
-                    position.x >= time_to_x(selection.time_start)
-                        && position.x <= time_to_x(selection.time_end)
-                        && position.y >= hz_to_y(selection.freq_high)
-                        && position.y <= hz_to_y(selection.freq_low)
-                }) {
+                } else if let Some(selection) = selections
+                    .iter()
+                    .rev()
+                    .find(|selection| point_in_selection(point_to_values(position), selection))
+                {
                     events.selected = Some(Some(selection.id));
-                    self.drag = Some(DragMode::Move {
-                        id: selection.id,
-                        last: position,
-                    });
+                    if !selection.is_polygon() {
+                        self.drag = Some(DragMode::Move {
+                            id: selection.id,
+                            last: position,
+                        });
+                    }
                 } else {
                     self.drag = Some(DragMode::Create(position));
                 }
             }
         }
 
-        if response.dragged_by(egui::PointerButton::Primary) {
+        if self.polygon_tool {
+            let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
+            let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
+            let right_clicked = response.clicked_by(egui::PointerButton::Secondary);
+            if escape || right_clicked {
+                self.polygon_points.clear();
+            } else {
+                let double_clicked = response.double_clicked_by(egui::PointerButton::Primary);
+                let clicked = response.clicked_by(egui::PointerButton::Primary);
+                let close_near_first = clicked
+                    && self.polygon_points.len() >= 3
+                    && hover_pointer.is_some_and(|cursor| {
+                        let first = egui::pos2(
+                            time_to_x(self.polygon_points[0].0),
+                            hz_to_y(self.polygon_points[0].1),
+                        );
+                        cursor.distance(first) <= 10.0
+                    });
+                if enter || double_clicked || close_near_first {
+                    if self.polygon_points.len() >= 3
+                        && polygon_area(&self.polygon_points).abs() > 1.0e-6
+                    {
+                        events.created_polygon = Some(std::mem::take(&mut self.polygon_points));
+                    } else if double_clicked || enter {
+                        self.polygon_points.clear();
+                    }
+                } else if clicked {
+                    if let Some(position) = hover_pointer {
+                        let point = point_to_values(position);
+                        let duplicate = self.polygon_points.last().is_some_and(|previous| {
+                            let dx = (point.0 - previous.0) * plot.width() / time_span;
+                            let dy = (point.1 - previous.1) * plot.height() / freq_span;
+                            dx.hypot(dy) < 3.0
+                        });
+                        if !duplicate {
+                            self.polygon_points.push(point);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !self.polygon_tool && response.dragged_by(egui::PointerButton::Primary) {
             if let Some(position) = pointer {
                 match self.drag {
+                    Some(DragMode::PolygonVertex { id, index }) => {
+                        if let Some(selection) = selections.iter_mut().find(|s| s.id == id) {
+                            if let SelectionShape::Polygon { points } = &mut selection.shape {
+                                if let Some(point) = points.get_mut(index) {
+                                    *point = point_to_values(position);
+                                    selection.refresh_bounds();
+                                    events.selections_changed = true;
+                                }
+                            }
+                        }
+                    }
                     Some(DragMode::Playhead) => events.seek_to = Some(point_to_values(position).0),
                     Some(DragMode::Move { id, last }) => {
                         let dt = (position.x - last.x) / plot.width() * time_span;
@@ -442,12 +794,19 @@ impl SpectrogramView {
                         if let Some(selection) = selections.iter_mut().find(|s| s.id == id) {
                             let time_delta =
                                 dt.clamp(-selection.time_start, duration - selection.time_end);
-                            let frequency_delta =
-                                df.clamp(-selection.freq_low, nyquist - selection.freq_high);
+                            let frequency_delta = if selection.full_band {
+                                0.0
+                            } else {
+                                df.clamp(-selection.freq_low, nyquist - selection.freq_high)
+                            };
                             selection.time_start += time_delta;
                             selection.time_end += time_delta;
                             selection.freq_low += frequency_delta;
                             selection.freq_high += frequency_delta;
+                            if selection.full_band {
+                                selection.freq_low = 0.0;
+                                selection.freq_high = nyquist;
+                            }
                             events.selections_changed = time_delta != 0.0 || frequency_delta != 0.0;
                         }
                         self.drag = Some(DragMode::Move { id, last: position });
@@ -468,19 +827,26 @@ impl SpectrogramView {
                                         (selection.time_end + delta_time).clamp(minimum, duration);
                                 }
                             }
-                            match corner {
-                                ResizeCorner::TopLeft | ResizeCorner::TopRight => {
-                                    let minimum = (selection.freq_low + 1.0).min(nyquist);
-                                    selection.freq_high = (selection.freq_high + delta_frequency)
-                                        .clamp(minimum, nyquist);
-                                }
-                                ResizeCorner::BottomLeft | ResizeCorner::BottomRight => {
-                                    let maximum = (selection.freq_high - 1.0).max(0.0);
-                                    selection.freq_low =
-                                        (selection.freq_low + delta_frequency).clamp(0.0, maximum);
+                            if selection.full_band {
+                                selection.freq_low = 0.0;
+                                selection.freq_high = nyquist;
+                            } else {
+                                match corner {
+                                    ResizeCorner::TopLeft | ResizeCorner::TopRight => {
+                                        let minimum = (selection.freq_low + 1.0).min(nyquist);
+                                        selection.freq_high = (selection.freq_high
+                                            + delta_frequency)
+                                            .clamp(minimum, nyquist);
+                                    }
+                                    ResizeCorner::BottomLeft | ResizeCorner::BottomRight => {
+                                        let maximum = (selection.freq_high - 1.0).max(0.0);
+                                        selection.freq_low = (selection.freq_low + delta_frequency)
+                                            .clamp(0.0, maximum);
+                                    }
                                 }
                             }
-                            events.selections_changed = delta_time != 0.0 || delta_frequency != 0.0;
+                            events.selections_changed = delta_time != 0.0
+                                || (!selection.full_band && delta_frequency != 0.0);
                         }
                         self.drag = Some(DragMode::Resize {
                             id,
@@ -501,7 +867,7 @@ impl SpectrogramView {
             }
         }
 
-        if response.drag_stopped() {
+        if !self.polygon_tool && response.drag_stopped() {
             events.drag_stopped = true;
             if let (Some(DragMode::Create(start)), Some(end)) = (self.drag, pointer) {
                 if (start.x - end.x).abs() > 4.0 && (start.y - end.y).abs() > 4.0 {
@@ -511,28 +877,36 @@ impl SpectrogramView {
                         && (end.y - plot.bottom()).abs() < 5.0)
                         || ((end.y - plot.top()).abs() < 5.0
                             && (start.y - plot.bottom()).abs() < 5.0);
-                    events.created =
-                        Some((t1.min(t2), t1.max(t2), f1.min(f2), f1.max(f2), full_band));
+                    events.created = Some((
+                        t1.min(t2),
+                        t1.max(t2),
+                        if full_band { 0.0 } else { f1.min(f2) },
+                        if full_band { nyquist } else { f1.max(f2) },
+                        full_band,
+                    ));
                 }
             }
             self.drag = None;
         }
 
         if response.secondary_clicked() {
-            events.deleted = pointer.and_then(|position| {
-                selections
-                    .iter()
-                    .rev()
-                    .find(|selection| {
-                        position.x >= time_to_x(selection.time_start)
-                            && position.x <= time_to_x(selection.time_end)
-                            && position.y >= hz_to_y(selection.freq_high)
-                            && position.y <= hz_to_y(selection.freq_low)
-                    })
-                    .map(|selection| selection.id)
-            });
+            if !self.polygon_tool {
+                events.deleted = pointer.and_then(|position| {
+                    selections
+                        .iter()
+                        .rev()
+                        .find(|selection| point_in_selection(point_to_values(position), selection))
+                        .map(|selection| selection.id)
+                });
+            }
         }
 
+        events.visible_ranges = (
+            self.time_range.map_or(0.0, |range| range.0),
+            self.time_range.map_or(duration, |range| range.1),
+            self.frequency_range.map_or(0.0, |range| range.0),
+            self.frequency_range.map_or(nyquist, |range| range.1),
+        );
         let _ = spectrogram;
         events
     }
@@ -594,7 +968,176 @@ fn format_frequency(hz: f32) -> String {
     }
 }
 
+fn polygon_area(points: &[(f32, f32)]) -> f32 {
+    if points.len() < 3 {
+        return 0.0;
+    }
+    (0..points.len())
+        .map(|index| {
+            let (x1, y1) = points[index];
+            let (x2, y2) = points[(index + 1) % points.len()];
+            x1 * y2 - x2 * y1
+        })
+        .sum::<f32>()
+        * 0.5
+}
+
+fn polygon_area_pixels(
+    points: &[(f32, f32)],
+    time_to_x: &impl Fn(f32) -> f32,
+    hz_to_y: &impl Fn(f32) -> f32,
+) -> f32 {
+    let screen = points
+        .iter()
+        .map(|(time, hz)| (time_to_x(*time), hz_to_y(*hz)))
+        .collect::<Vec<_>>();
+    polygon_area(&screen).abs()
+}
+
+fn point_in_polygon(point: (f32, f32), polygon: &[(f32, f32)]) -> bool {
+    if polygon.len() < 3 {
+        return false;
+    }
+    let (x, y) = point;
+    let mut inside = false;
+    let mut previous = polygon.len() - 1;
+    for current in 0..polygon.len() {
+        let (xi, yi) = polygon[current];
+        let (xj, yj) = polygon[previous];
+        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        previous = current;
+    }
+    inside
+}
+
+fn point_in_selection(point: (f32, f32), selection: &Selection) -> bool {
+    match &selection.shape {
+        SelectionShape::Rect => {
+            point.0 >= selection.time_start
+                && point.0 <= selection.time_end
+                && point.1 >= selection.freq_low
+                && point.1 <= selection.freq_high
+        }
+        SelectionShape::Polygon { points } => point_in_polygon(point, points),
+    }
+}
+
+fn draw_dashed_line(
+    painter: &egui::Painter,
+    start: egui::Pos2,
+    end: egui::Pos2,
+    color: egui::Color32,
+) {
+    let delta = end - start;
+    let length = delta.length();
+    if length <= f32::EPSILON {
+        return;
+    }
+    let direction = delta / length;
+    let dash = 6.0;
+    let gap = 4.0;
+    let mut offset = 0.0;
+    while offset < length {
+        let finish = (offset + dash).min(length);
+        painter.line_segment(
+            [start + direction * offset, start + direction * finish],
+            egui::Stroke::new(1.5, color),
+        );
+        offset += dash + gap;
+    }
+}
+
+fn draw_polygon_fill(painter: &egui::Painter, points: &[egui::Pos2], color: egui::Color32) {
+    if points.len() < 3 {
+        return;
+    }
+    // Ear-clipping triangulation supports concave simple polygons unlike
+    // Shape::convex_polygon. Selection validation rejects tiny polygons.
+    let signed_area = points
+        .iter()
+        .enumerate()
+        .map(|(index, point)| {
+            let next = points[(index + 1) % points.len()];
+            point.x * next.y - next.x * point.y
+        })
+        .sum::<f32>();
+    if signed_area.abs() < 1.0e-4 {
+        return;
+    }
+    let orientation = signed_area.signum();
+    let mut vertices = (0..points.len()).collect::<Vec<_>>();
+    let mut triangles = Vec::new();
+    let cross = |a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| {
+        (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+    };
+    let inside_triangle = |p: egui::Pos2, a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| {
+        let ab = cross(a, b, p);
+        let bc = cross(b, c, p);
+        let ca = cross(c, a, p);
+        (ab >= 0.0 && bc >= 0.0 && ca >= 0.0) || (ab <= 0.0 && bc <= 0.0 && ca <= 0.0)
+    };
+    let mut attempts = 0;
+    while vertices.len() > 3 && attempts < points.len() * points.len() {
+        attempts += 1;
+        let mut ear_found = false;
+        for index in 0..vertices.len() {
+            let previous = vertices[(index + vertices.len() - 1) % vertices.len()];
+            let current = vertices[index];
+            let next = vertices[(index + 1) % vertices.len()];
+            if cross(points[previous], points[current], points[next]) * orientation <= 1.0e-5 {
+                continue;
+            }
+            if vertices.iter().copied().any(|candidate| {
+                candidate != previous
+                    && candidate != current
+                    && candidate != next
+                    && inside_triangle(
+                        points[candidate],
+                        points[previous],
+                        points[current],
+                        points[next],
+                    )
+            }) {
+                continue;
+            }
+            triangles.push([previous, current, next]);
+            vertices.remove(index);
+            ear_found = true;
+            break;
+        }
+        if !ear_found {
+            return;
+        }
+    }
+    if vertices.len() == 3 {
+        triangles.push([vertices[0], vertices[1], vertices[2]]);
+    }
+    for triangle in triangles {
+        painter.add(egui::Shape::convex_polygon(
+            triangle.into_iter().map(|index| points[index]).collect(),
+            color.gamma_multiply(0.25),
+            egui::Stroke::NONE,
+        ));
+    }
+}
+
 pub fn color_image(spectrogram: &Spectrogram) -> egui::ColorImage {
+    color_image_inner(spectrogram, None).expect("non-cancellable image conversion returns a result")
+}
+
+pub fn color_image_cancellable(
+    spectrogram: &Spectrogram,
+    cancelled: &AtomicBool,
+) -> Option<egui::ColorImage> {
+    color_image_inner(spectrogram, Some(cancelled))
+}
+
+fn color_image_inner(
+    spectrogram: &Spectrogram,
+    cancelled: Option<&AtomicBool>,
+) -> Option<egui::ColorImage> {
     let max_width = 8192usize;
     let width = spectrogram.n_time.min(max_width).max(1);
     let height = spectrogram.n_freq.max(1);
@@ -613,6 +1156,9 @@ pub fn color_image(spectrogram: &Spectrogram) -> egui::ColorImage {
         .par_chunks_mut(width)
         .enumerate()
         .for_each(|(y, row)| {
+            if cancelled.is_some_and(|token| token.load(Ordering::Relaxed)) {
+                return;
+            }
             let frequency = height
                 .saturating_sub(1)
                 .saturating_sub(y)
@@ -631,7 +1177,11 @@ pub fn color_image(spectrogram: &Spectrogram) -> egui::ColorImage {
                 }
             }
         });
-    egui::ColorImage::new([width, height], pixels)
+    if cancelled.is_some_and(|token| token.load(Ordering::Relaxed)) {
+        None
+    } else {
+        Some(egui::ColorImage::new([width, height], pixels))
+    }
 }
 
 /// Convert changed STFT columns into a texture patch, retaining the original

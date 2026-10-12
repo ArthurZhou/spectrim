@@ -16,20 +16,67 @@ use rayon::prelude::*;
 use rustfft::num_complex::Complex32;
 use rustfft::FftPlanner;
 
-use super::types::{hann_window, AudioData, Selection, SelectionAction};
+use super::types::{hann_window, AudioData, Selection, SelectionAction, SelectionShape};
 
 pub fn apply_selections(audio: &AudioData, selections: &[Selection]) -> Vec<f32> {
+    let enabled = selections
+        .iter()
+        .filter(|selection| selection.enabled)
+        .cloned()
+        .collect::<Vec<_>>();
+    if enabled.len() != selections.len() {
+        return apply_selections(audio, &enabled);
+    }
     if selections.is_empty() {
         return audio.samples.clone();
     }
-    if selections.iter().all(|selection| selection.full_band) {
+    if selections
+        .iter()
+        .all(|selection| selection.full_band && !selection.is_polygon())
+    {
         apply_time_domain(audio, selections)
     } else {
         apply_spectral_masks(audio, selections, 2048, 512)
     }
 }
 
+/// Remove leading/trailing silence while preserving interleaved channel frames.
+/// `threshold` is a linear peak-amplitude threshold (0.001 is approximately -60 dBFS).
+pub fn trim_silence(samples: &[f32], channels: u16, threshold: f32) -> Vec<f32> {
+    let channels = channels as usize;
+    if channels == 0 || samples.is_empty() {
+        return samples.to_vec();
+    }
+    let frames = samples.len() / channels;
+    let threshold = threshold.max(0.0);
+    let is_silent = |frame: usize| {
+        samples[frame * channels..(frame + 1) * channels]
+            .iter()
+            .all(|sample| sample.abs() <= threshold)
+    };
+    let first = (0..frames).find(|frame| !is_silent(*frame));
+    let Some(first) = first else {
+        return Vec::new();
+    };
+    let last = (first..frames)
+        .rev()
+        .find(|frame| !is_silent(*frame))
+        .unwrap_or(first);
+    samples[first * channels..(last + 1) * channels].to_vec()
+}
+
 pub fn apply_time_domain(audio: &AudioData, selections: &[Selection]) -> Vec<f32> {
+    let enabled = selections
+        .iter()
+        .filter(|selection| selection.enabled)
+        .cloned()
+        .collect::<Vec<_>>();
+    if enabled.len() != selections.len() {
+        return apply_time_domain(audio, &enabled);
+    }
+    if selections.iter().any(Selection::is_polygon) {
+        return apply_spectral_masks(audio, selections, 2048, 512);
+    }
     let channels = audio.channels as usize;
     if channels == 0 {
         return audio.samples.clone();
@@ -203,9 +250,67 @@ struct MaskRegion {
     action: SelectionAction,
     frame_start: usize,
     frame_end: usize,
-    bin_start: usize,
-    bin_end: usize,
+    bins: MaskBins,
     gain: f32,
+}
+
+enum MaskBins {
+    Rect(Vec<(usize, usize)>),
+    Polygon(Vec<Vec<(usize, usize)>>),
+}
+
+impl MaskRegion {
+    fn bins_at(&self, time_frame: usize) -> &[(usize, usize)] {
+        match &self.bins {
+            MaskBins::Rect(intervals) => intervals,
+            MaskBins::Polygon(rows) => rows
+                .get(time_frame.saturating_sub(self.frame_start))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rasterize_polygon(
+    points: &[(f32, f32)],
+    first_frame: usize,
+    last_frame: usize,
+    n_time: usize,
+    n_freq: usize,
+    n_fft: usize,
+    hop: usize,
+    sample_rate: f32,
+) -> Vec<Vec<(usize, usize)>> {
+    if points.len() < 3 || n_freq == 0 || n_time == 0 {
+        return Vec::new();
+    }
+    let mut rows = Vec::with_capacity(last_frame.saturating_sub(first_frame) + 1);
+    for time_frame in first_frame..=last_frame.min(n_time.saturating_sub(1)) {
+        let time = time_frame as f32 * hop as f32 / sample_rate;
+        let mut intersections = Vec::new();
+        for index in 0..points.len() {
+            let (x1, y1) = points[index];
+            let (x2, y2) = points[(index + 1) % points.len()];
+            if (x1 <= time && time < x2) || (x2 <= time && time < x1) {
+                let fraction = (time - x1) / (x2 - x1);
+                intersections.push(y1 + fraction * (y2 - y1));
+            }
+        }
+        intersections.sort_by(f32::total_cmp);
+        let mut intervals = Vec::new();
+        for pair in intersections.chunks_exact(2) {
+            let first_bin = (pair[0] * n_fft as f32 / sample_rate).ceil() as isize;
+            let last_bin = (pair[1] * n_fft as f32 / sample_rate).floor() as isize;
+            let first_bin = first_bin.clamp(0, n_freq.saturating_sub(1) as isize) as usize;
+            let last_bin = last_bin.clamp(0, n_freq.saturating_sub(1) as isize) as usize;
+            if first_bin <= last_bin {
+                intervals.push((first_bin, last_bin));
+            }
+        }
+        rows.push(intervals);
+    }
+    rows
 }
 
 pub fn apply_spectral_masks(
@@ -214,12 +319,23 @@ pub fn apply_spectral_masks(
     n_fft: usize,
     hop: usize,
 ) -> Vec<f32> {
+    let enabled = selections
+        .iter()
+        .filter(|selection| selection.enabled)
+        .cloned()
+        .collect::<Vec<_>>();
+    if enabled.len() != selections.len() {
+        return apply_spectral_masks(audio, &enabled, n_fft, hop);
+    }
     let channels = audio.channels as usize;
     if channels == 0 || n_fft < 2 || hop == 0 || audio.samples.is_empty() {
         return audio.samples.clone();
     }
     let input_frames = audio.frame_count();
     if input_frames < n_fft {
+        if selections.iter().any(Selection::is_polygon) {
+            return audio.samples.clone();
+        }
         return apply_time_domain(audio, selections);
     }
     let n_freq = n_fft / 2 + 1;
@@ -233,16 +349,30 @@ pub fn apply_spectral_masks(
     // Precompute mask geometry; regions that touch no frame or no bin drop out.
     let mask_regions: Vec<MaskRegion> = selections
         .iter()
-        .map(|selection| resolve(selection, sample_rate))
-        .filter_map(|region| {
+        .filter_map(|selection| {
+            let region = resolve(selection, sample_rate);
             let frames = active_frame_range(&region, n_time, hop, sample_rate)?;
-            let bins = active_bin_range(&region, n_freq, n_fft, sample_rate)?;
+            let bins = match &selection.shape {
+                SelectionShape::Rect => {
+                    let (first, last) = active_bin_range(&region, n_freq, n_fft, sample_rate)?;
+                    MaskBins::Rect(vec![(first, last)])
+                }
+                SelectionShape::Polygon { points } => MaskBins::Polygon(rasterize_polygon(
+                    points,
+                    frames.0,
+                    frames.1,
+                    n_time,
+                    n_freq,
+                    n_fft,
+                    hop,
+                    sample_rate,
+                )),
+            };
             Some(MaskRegion {
                 action: region.action,
                 frame_start: frames.0,
                 frame_end: frames.1,
-                bin_start: bins.0,
-                bin_end: bins.1,
+                bins,
                 gain: region.gain,
             })
         })
@@ -299,19 +429,19 @@ pub fn apply_spectral_masks(
                             match region.action {
                                 SelectionAction::Solo => {
                                     if has_solo {
-                                        for slot in
-                                            keep[region.bin_start..=region.bin_end].iter_mut()
-                                        {
-                                            *slot = true;
+                                        for (first, last) in region.bins_at(time_frame) {
+                                            for slot in keep[*first..=*last].iter_mut() {
+                                                *slot = true;
+                                            }
                                         }
                                     }
                                 }
                                 SelectionAction::Gain => {
                                     if !has_solo {
-                                        for slot in
-                                            gains[region.bin_start..=region.bin_end].iter_mut()
-                                        {
-                                            *slot *= region.gain;
+                                        for (first, last) in region.bins_at(time_frame) {
+                                            for slot in gains[*first..=*last].iter_mut() {
+                                                *slot *= region.gain;
+                                            }
                                         }
                                     }
                                 }
@@ -444,6 +574,46 @@ mod tests {
         let output = apply_spectral_masks(&audio, &[gain], 256, 64);
         assert_eq!(output.len(), audio.samples.len());
         assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn polygon_mask_attenuates_only_bins_inside_sloped_region() {
+        let sample_rate = 8_000;
+        let frames = 40_000;
+        let audio = AudioData {
+            samples: (0..frames)
+                .map(|index| {
+                    let time = index as f32 / sample_rate as f32;
+                    (2.0 * std::f32::consts::PI * 700.0 * time).sin()
+                        + (2.0 * std::f32::consts::PI * 1_800.0 * time).sin()
+                })
+                .collect(),
+            sample_rate,
+            channels: 1,
+            duration: frames as f32 / sample_rate as f32,
+        };
+        let polygon = Selection::polygon(
+            99,
+            vec![(0.2, 500.0), (1.4, 2_200.0), (1.4, 2_500.0), (0.2, 800.0)],
+            SelectionAction::Gain,
+        );
+        let mut polygon = polygon;
+        polygon.gain = 0.0;
+        let output = apply_selections(&audio, &[polygon]);
+        assert_eq!(output.len(), audio.samples.len());
+        assert!(output.iter().all(|sample| sample.is_finite()));
+
+        let original_rms = |samples: &[f32]| {
+            (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32)
+                .sqrt()
+        };
+        let inside = 7_200..9_600;
+        assert!(original_rms(&output[inside.clone()]) < original_rms(&audio.samples[inside]));
+        let outside = 16_000..24_000;
+        assert!(
+            (original_rms(&output[outside.clone()]) - original_rms(&audio.samples[outside])).abs()
+                < 2.0e-2
+        );
     }
 
     /// The precomputed frame/bin ranges must reproduce the current per-bin

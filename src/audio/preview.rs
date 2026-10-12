@@ -29,7 +29,8 @@
 use rayon::prelude::*;
 
 use super::iir;
-use super::types::{AudioData, Selection, SelectionAction};
+use super::process::apply_spectral_masks;
+use super::types::{AudioData, Selection, SelectionAction, SelectionShape};
 
 /// What a render call produced.
 #[derive(Debug)]
@@ -369,9 +370,20 @@ fn render_range(
 
 /// Render a whole preview from scratch (no cache).
 pub fn render_full(audio: &AudioData, selections: &[Selection]) -> Vec<f32> {
+    let enabled = selections
+        .iter()
+        .filter(|selection| selection.enabled)
+        .cloned()
+        .collect::<Vec<_>>();
+    if enabled.len() != selections.len() {
+        return render_full(audio, &enabled);
+    }
     let channels = audio.channels as usize;
     if channels == 0 || audio.samples.is_empty() || selections.is_empty() {
         return audio.samples.clone();
+    }
+    if selections.iter().any(Selection::is_polygon) {
+        return apply_spectral_masks(audio, selections, 2048, 512);
     }
     if selections.iter().all(|s| s.full_band) {
         return render_time_domain(audio, selections, 0, audio.frame_count());
@@ -403,9 +415,30 @@ impl PreviewCache {
     /// as possible. Read `self.samples` afterwards; the returned outcome says
     /// what was recomputed (if anything).
     pub fn render(&mut self, audio: &AudioData, selections: &[Selection]) -> PreviewOutcome {
+        let enabled = selections
+            .iter()
+            .filter(|selection| selection.enabled)
+            .cloned()
+            .collect::<Vec<_>>();
+        if enabled.len() != selections.len() {
+            return self.render(audio, &enabled);
+        }
         let signature = AudioSignature::of(audio);
         let channels = audio.channels as usize;
         let frames = audio.frame_count();
+
+        if selections.iter().any(Selection::is_polygon)
+            || self.selections.iter().any(Selection::is_polygon)
+        {
+            self.samples = render_full(audio, selections);
+            self.selections = selections.to_vec();
+            self.band_signals.clear();
+            self.audio_signature = signature;
+            return PreviewOutcome {
+                changed_frames: Some((0, frames)),
+                full_rebuild: true,
+            };
+        }
 
         // Different audio (or first call) -> full rebuild.
         if self.audio_signature != signature || self.samples.len() != frames * channels {
@@ -417,6 +450,21 @@ impl PreviewCache {
                 build_band_signals(audio, selections)
             };
             self.samples = render_full(audio, selections);
+            return PreviewOutcome {
+                changed_frames: Some((0, frames)),
+                full_rebuild: true,
+            };
+        }
+
+        // Keep polygon previews on the same exact STFT path as export. The
+        // IIR cache represents a band rectangle and cannot follow polygon edges.
+        if selections.iter().any(Selection::is_polygon)
+            || self.selections.iter().any(Selection::is_polygon)
+        {
+            self.samples = render_full(audio, selections);
+            self.selections = selections.to_vec();
+            self.band_signals.clear();
+            self.audio_signature = signature;
             return PreviewOutcome {
                 changed_frames: Some((0, frames)),
                 full_rebuild: true,
@@ -438,7 +486,7 @@ impl PreviewCache {
             self.band_signals.clear();
         }
 
-        let (span_start, span_end) = self.compute_span(audio, &diff);
+        let (span_start, span_end) = self.compute_span(audio, selections, &diff);
         let span_start = span_start.min(frames);
         let span_end = span_end.clamp(span_start, frames);
 
@@ -524,9 +572,20 @@ impl PreviewCache {
 
     /// Union of the time windows of everything that changed, in frames, plus a
     /// small guard band. When nothing can be localised, the whole track.
-    fn compute_span(&self, audio: &AudioData, diff: &SelectionDiff) -> (usize, usize) {
+    fn compute_span(
+        &self,
+        audio: &AudioData,
+        selections: &[Selection],
+        diff: &SelectionDiff,
+    ) -> (usize, usize) {
         let sample_rate = audio.sample_rate.max(1) as f32;
         let frames = audio.frame_count();
+
+        if selections.iter().any(Selection::is_polygon)
+            || self.selections.iter().any(Selection::is_polygon)
+        {
+            return (0, frames);
+        }
 
         let mut start = f32::INFINITY;
         let mut end = f32::NEG_INFINITY;
@@ -552,6 +611,10 @@ impl PreviewCache {
                 .find(|s| &s.id == id)
                 .map(|s| s.action == SelectionAction::Solo)
                 .unwrap_or(false)
+                || selections
+                    .iter()
+                    .find(|s| &s.id == id)
+                    .is_some_and(|s| s.action == SelectionAction::Solo)
         }) || diff
             .added_regions
             .iter()
@@ -561,16 +624,10 @@ impl PreviewCache {
                     .iter()
                     .any(|s| &s.id == id && s.action == SelectionAction::Solo)
             });
-        if solo_semantics_changed
-            && (self
-                .selections
-                .iter()
-                .any(|s| s.action == SelectionAction::Solo)
-                || diff
-                    .added_regions
-                    .iter()
-                    .any(|s| s.action == SelectionAction::Solo))
-        {
+        // Any edit to a Solo region changes the keep/silence decision outside
+        // its time/frequency bounds too. In particular, removing the last Solo
+        // restores audio over the entire track, so a local splice is incorrect.
+        if solo_semantics_changed {
             return (0, frames);
         }
 
@@ -623,15 +680,17 @@ fn diff_selections(old: &[Selection], new: &[Selection]) -> SelectionDiff {
                 let gain_changed = (o.gain - s.gain).abs() > 1.0e-4;
                 let action_changed = o.action != s.action;
                 let full_band_changed = o.full_band != s.full_band;
+                let shape_changed = o.shape != s.shape;
                 if band_changed
                     || time_changed
                     || gain_changed
                     || action_changed
                     || full_band_changed
+                    || shape_changed
                 {
                     diff.changed.push(s.id);
                 }
-                if band_changed || full_band_changed {
+                if band_changed || full_band_changed || shape_changed {
                     diff.band_changed.push(s.id);
                 }
             }
@@ -675,6 +734,22 @@ mod tests {
     }
 
     #[test]
+    fn polygon_preview_uses_exact_stft_mask_and_disabled_regions_are_ignored() {
+        let audio = tone(48_000, 440.0, 48_000);
+        let mut polygon = Selection::polygon(
+            31,
+            vec![(0.2, 300.0), (0.8, 900.0), (0.9, 1_200.0), (0.3, 700.0)],
+            SelectionAction::Gain,
+        );
+        polygon.gain = 0.0;
+        let exact = apply_spectral_masks(&audio, std::slice::from_ref(&polygon), 2048, 512);
+        assert_eq!(render_full(&audio, std::slice::from_ref(&polygon)), exact);
+
+        polygon.enabled = false;
+        assert_eq!(render_full(&audio, &[polygon]), audio.samples);
+    }
+
+    #[test]
     fn incremental_render_matches_fresh_full_render() {
         let audio = tone(96_000, 440.0, 48_000);
         let mut sel_a = Selection::new(1, 0.5, 1.0, 0.0, 24_000.0, SelectionAction::Gain, true);
@@ -706,6 +781,87 @@ mod tests {
         // And it must actually differ from the previous state.
         let unchanged = cache.render(&audio, std::slice::from_ref(&sel_b));
         assert!(unchanged.changed_frames.is_none(), "no-op not detected");
+    }
+
+    #[test]
+    fn removing_last_solo_rebuilds_audio_outside_old_region() {
+        let audio = tone(96_000, 440.0, 48_000);
+        let solo = Selection::new(7, 0.5, 0.75, 0.0, 24_000.0, SelectionAction::Solo, true);
+        let mut cache = PreviewCache::new();
+        cache.render(&audio, std::slice::from_ref(&solo));
+        assert!(cache.samples[..20_000].iter().all(|sample| *sample == 0.0));
+
+        let outcome = cache.render(&audio, &[]);
+        assert_eq!(outcome.changed_frames, Some((0, audio.frame_count())));
+        assert!(cache.samples[..20_000]
+            .iter()
+            .any(|sample| sample.abs() > 1.0e-3));
+        assert_eq!(cache.samples, audio.samples);
+    }
+
+    #[test]
+    fn changing_gain_to_solo_rebuilds_the_entire_preview() {
+        let audio = tone(96_000, 440.0, 48_000);
+        let mut selection =
+            Selection::new(8, 0.5, 0.75, 0.0, 24_000.0, SelectionAction::Gain, true);
+        selection.gain = 0.0;
+        let mut cache = PreviewCache::new();
+        cache.render(&audio, std::slice::from_ref(&selection));
+
+        selection.action = SelectionAction::Solo;
+        let outcome = cache.render(&audio, std::slice::from_ref(&selection));
+        assert_eq!(outcome.changed_frames, Some((0, audio.frame_count())));
+        assert!(cache.samples[..20_000].iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn full_band_toggle_updates_incremental_preview_to_match_fresh_render() {
+        let audio = tone(96_000, 440.0, 48_000);
+        let mut selection = Selection::new(9, 0.4, 0.8, 300.0, 900.0, SelectionAction::Gain, false);
+        selection.gain = 0.0;
+        let mut cache = PreviewCache::new();
+        cache.render(&audio, std::slice::from_ref(&selection));
+
+        selection.full_band = true;
+        selection.freq_low = 0.0;
+        selection.freq_high = 24_000.0;
+        let outcome = cache.render(&audio, std::slice::from_ref(&selection));
+        assert!(outcome.changed_frames.is_some());
+
+        let mut fresh = PreviewCache::new();
+        fresh.render(&audio, std::slice::from_ref(&selection));
+        assert_eq!(cache.samples, fresh.samples);
+    }
+
+    #[test]
+    fn frequency_edge_edit_refreshes_iir_band_cache() {
+        let sample_rate = 48_000;
+        let audio = AudioData {
+            samples: (0..96_000)
+                .map(|i| {
+                    let t = i as f32 / sample_rate as f32;
+                    (2.0 * std::f32::consts::PI * 700.0 * t).sin()
+                        + (2.0 * std::f32::consts::PI * 4_000.0 * t).sin()
+                })
+                .collect(),
+            sample_rate,
+            channels: 1,
+            duration: 2.0,
+        };
+        let mut selection =
+            Selection::new(11, 0.2, 1.8, 500.0, 1_000.0, SelectionAction::Gain, false);
+        selection.gain = 0.0;
+        let mut cache = PreviewCache::new();
+        cache.render(&audio, std::slice::from_ref(&selection));
+
+        selection.freq_low = 3_500.0;
+        selection.freq_high = 4_500.0;
+        let outcome = cache.render(&audio, std::slice::from_ref(&selection));
+        assert!(outcome.changed_frames.is_some());
+
+        let mut fresh = PreviewCache::new();
+        fresh.render(&audio, std::slice::from_ref(&selection));
+        assert_eq!(cache.samples, fresh.samples);
     }
 
     #[test]

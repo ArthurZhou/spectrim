@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rayon::prelude::*;
 use rustfft::num_complex::Complex32;
@@ -9,6 +10,24 @@ use super::types::{hann_window, AudioData, Spectrogram};
 pub fn compute(audio: &AudioData, n_fft: usize, hop: usize) -> Spectrogram {
     let mono = mono_from_interleaved(&audio.samples, audio.channels);
     compute_mono(mono.as_ref(), audio.sample_rate, n_fft, hop)
+}
+
+/// Cancellable full transform used during file loading. Workers check the token
+/// between frames, then stop doing FFT work once cancellation is requested.
+pub fn compute_cancellable(
+    audio: &AudioData,
+    n_fft: usize,
+    hop: usize,
+    cancelled: &AtomicBool,
+) -> Option<Spectrogram> {
+    let mono = mono_from_interleaved(&audio.samples, audio.channels);
+    compute_mono_inner(
+        mono.as_ref(),
+        audio.sample_rate,
+        n_fft,
+        hop,
+        Some(cancelled),
+    )
 }
 
 /// Compute the spectrogram of an interleaved PCM buffer without cloning it into
@@ -22,6 +41,18 @@ pub fn compute_interleaved(
 ) -> Spectrogram {
     let mono = mono_from_interleaved(samples, channels);
     compute_mono(mono.as_ref(), sample_rate, n_fft, hop)
+}
+
+pub fn compute_interleaved_cancellable(
+    samples: &[f32],
+    channels: u16,
+    sample_rate: u32,
+    n_fft: usize,
+    hop: usize,
+    cancelled: &AtomicBool,
+) -> Option<Spectrogram> {
+    let mono = mono_from_interleaved(samples, channels);
+    compute_mono_inner(mono.as_ref(), sample_rate, n_fft, hop, Some(cancelled))
 }
 
 /// A frequency-major patch of spectrogram columns changed by a PCM frame span.
@@ -44,7 +75,7 @@ pub fn expanded_patch_frames(
     hop: usize,
     max_texture_width: usize,
 ) -> (usize, usize) {
-    if n_total_time == 0 || total_pcm_frames == 0 || n_fft == 0 || hop == 0 {
+    if n_total_time == 0 || total_pcm_frames < n_fft || n_fft == 0 || hop == 0 {
         return changed_frames;
     }
     let width = n_total_time.min(max_texture_width.max(1));
@@ -52,8 +83,8 @@ pub fn expanded_patch_frames(
         0
     } else {
         (changed_frames.0 - n_fft) / hop + 1
-    }
-    .min(n_total_time);
+    };
+    first_fft = first_fft.min(n_total_time);
     let mut last_fft = changed_frames.1.saturating_sub(1) / hop + 1;
     if last_fft <= first_fft {
         return changed_frames;
@@ -186,9 +217,20 @@ fn mono_from_interleaved(samples: &[f32], channels: u16) -> Cow<'_, [f32]> {
 }
 
 fn compute_mono(mono: &[f32], sample_rate: u32, n_fft: usize, hop: usize) -> Spectrogram {
+    compute_mono_inner(mono, sample_rate, n_fft, hop, None)
+        .expect("non-cancellable spectrogram computation returns a result")
+}
+
+fn compute_mono_inner(
+    mono: &[f32],
+    sample_rate: u32,
+    n_fft: usize,
+    hop: usize,
+    cancelled: Option<&AtomicBool>,
+) -> Option<Spectrogram> {
     let n_freq = n_fft / 2 + 1;
     if n_fft == 0 || hop == 0 || mono.len() < n_fft {
-        return Spectrogram {
+        return Some(Spectrogram {
             matrix: Vec::new(),
             n_freq,
             n_time: 0,
@@ -197,7 +239,7 @@ fn compute_mono(mono: &[f32], sample_rate: u32, n_fft: usize, hop: usize) -> Spe
             sample_rate,
             db_min: 0.0,
             db_max: 0.0,
-        };
+        });
     }
 
     let n_time = (mono.len() - n_fft) / hop + 1;
@@ -214,6 +256,9 @@ fn compute_mono(mono: &[f32], sample_rate: u32, n_fft: usize, hop: usize) -> Spe
     time_major.par_chunks_mut(n_freq).enumerate().for_each_init(
         || vec![Complex32::default(); n_fft],
         |frame, (time, output)| {
+            if cancelled.is_some_and(|token| token.load(Ordering::Relaxed)) {
+                return;
+            }
             let start = time * hop;
             for index in 0..n_fft {
                 frame[index] = Complex32::new(mono[start + index] * window[index], 0.0);
@@ -230,6 +275,10 @@ fn compute_mono(mono: &[f32], sample_rate: u32, n_fft: usize, hop: usize) -> Spe
         },
     );
 
+    if cancelled.is_some_and(|token| token.load(Ordering::Relaxed)) {
+        return None;
+    }
+
     let mut matrix = vec![0.0f32; n_freq * n_time];
     matrix
         .par_chunks_mut(n_time)
@@ -241,7 +290,7 @@ fn compute_mono(mono: &[f32], sample_rate: u32, n_fft: usize, hop: usize) -> Spe
         });
 
     let (db_min, db_max) = compute_db_range(&matrix);
-    Spectrogram {
+    Some(Spectrogram {
         matrix,
         n_freq,
         n_time,
@@ -250,7 +299,7 @@ fn compute_mono(mono: &[f32], sample_rate: u32, n_fft: usize, hop: usize) -> Spe
         sample_rate,
         db_min,
         db_max,
-    }
+    })
 }
 
 /// 5th/95th percentile of the dB distribution, used to normalise the colormap.

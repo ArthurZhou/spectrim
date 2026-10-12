@@ -1,6 +1,7 @@
 use rayon::prelude::*;
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
@@ -44,6 +45,13 @@ impl From<std::io::Error> for DecodeError {
 }
 
 pub fn decode_file(path: &Path) -> Result<DecodedAudio, DecodeError> {
+    decode_file_cancellable(path, &AtomicBool::new(false))
+}
+
+pub fn decode_file_cancellable(
+    path: &Path,
+    cancelled: &AtomicBool,
+) -> Result<DecodedAudio, DecodeError> {
     let file = File::open(path)?;
     let source = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
@@ -91,6 +99,9 @@ pub fn decode_file(path: &Path) -> Result<DecodedAudio, DecodeError> {
     }
 
     loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(DecodeError::DecodeFailure("Loading cancelled".to_owned()));
+        }
         let packet = match format.next_packet() {
             Ok(packet) => packet,
             Err(SymphoniaError::IoError(error))

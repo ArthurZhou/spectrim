@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
@@ -7,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::audio::decode::decode_file;
 use crate::audio::export::export_wav;
 use crate::audio::preview::{PreviewCache, PreviewOutcome};
 use crate::audio::process::apply_selections;
@@ -22,6 +22,23 @@ use crate::ui::spectrogram_view::SpectrogramView;
 /// per frame would swamp the worker, so we wait for the pointer to settle
 /// instead, then do one incremental render.
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(60);
+const MAX_SPECTROGRAM_CELLS: usize = 8 * 1024 * 1024;
+type LoadedPayload = (
+    PathBuf,
+    Arc<AudioData>,
+    Arc<AudioData>,
+    Spectrogram,
+    egui::ColorImage,
+);
+
+fn spectrogram_hop(frames: usize, n_fft: usize) -> usize {
+    let n_freq = n_fft / 2 + 1;
+    let minimum_hop = frames
+        .saturating_mul(n_freq)
+        .div_ceil(MAX_SPECTROGRAM_CELLS)
+        .max(512);
+    minimum_hop.div_ceil(512).saturating_mul(512)
+}
 
 /// The decoded track plus its analysis.
 ///
@@ -43,19 +60,8 @@ struct LoadedAudio {
 }
 
 enum LoadMessage {
-    Progress(String),
-    Loaded(
-        Result<
-            (
-                PathBuf,
-                Arc<AudioData>,
-                Arc<AudioData>,
-                Spectrogram,
-                egui::ColorImage,
-            ),
-            String,
-        >,
-    ),
+    Progress(u64, String),
+    Loaded(u64, Result<LoadedPayload, String>),
 }
 
 /// Work request for the background preview/export worker.
@@ -64,6 +70,8 @@ enum WorkerJob {
     Preview {
         audio: Arc<AudioData>,
         selections: Vec<Selection>,
+        spectrogram_n_fft: usize,
+        spectrogram_hop: usize,
         revision: u64,
     },
     /// Exact STFT render for writing a WAV file.
@@ -71,6 +79,7 @@ enum WorkerJob {
         audio: Arc<AudioData>,
         selections: Vec<Selection>,
         path: PathBuf,
+        crop_silence: bool,
     },
 }
 
@@ -81,6 +90,8 @@ enum SpectrogramJob {
         samples: Arc<Vec<f32>>,
         channels: u16,
         sample_rate: u32,
+        n_fft: usize,
+        hop: usize,
         changed_frames: (usize, usize),
         revision: u64,
     },
@@ -88,6 +99,16 @@ enum SpectrogramJob {
         samples: Arc<Vec<f32>>,
         channels: u16,
         sample_rate: u32,
+        n_fft: usize,
+        hop: usize,
+        revision: u64,
+    },
+    ViewDetail {
+        samples: Arc<Vec<f32>>,
+        channels: u16,
+        sample_rate: u32,
+        time_range: (f32, f32),
+        n_fft: usize,
         revision: u64,
     },
 }
@@ -98,11 +119,11 @@ enum WorkerMessage {
     PreviewDone {
         samples: Arc<Vec<f32>>,
         changed_frames: Option<(usize, usize)>,
-        full_rebuild: bool,
         revision: u64,
     },
     SpectrogramDone(u64, SpectrogramPatch),
     SpectrogramRebuilt(u64, Spectrogram),
+    ViewDetailReady(u64, f32, f32, Spectrogram),
     ExportDone(Result<(), String>),
 }
 
@@ -111,6 +132,9 @@ pub struct SpectrimApp {
     status: String,
     status_is_error: bool,
     load_receiver: Option<Receiver<LoadMessage>>,
+    load_cancel: Option<Arc<AtomicBool>>,
+    load_cancel_requested: bool,
+    load_revision: u64,
     load_started: Option<Instant>,
     /// Sender end of the persistent worker; `None` when no worker is running.
     worker_sender: Option<mpsc::Sender<WorkerJob>>,
@@ -137,13 +161,22 @@ pub struct SpectrimApp {
     preview_cache: PreviewCache,
     /// Set when a preview render has been requested but not yet dispatched.
     preview_dirty: bool,
+    fft_size: usize,
+    fft_zoom_target: Option<(usize, (f32, f32), Instant)>,
+    detail_revision: u64,
+    detail_in_flight: bool,
     /// When the last edit happened, for debouncing.
     last_edit: Option<Instant>,
     selections: Vec<Selection>,
     selected_selection: Option<u64>,
     next_selection_id: u64,
     default_action: SelectionAction,
+    polygon_tool: bool,
     spectrogram_view: SpectrogramView,
+    pointer_coordinates: Option<(f32, f32)>,
+    visible_time_range: (f32, f32),
+    export_dialog_open: bool,
+    export_crop_silence: bool,
 }
 
 impl Default for SpectrimApp {
@@ -153,6 +186,9 @@ impl Default for SpectrimApp {
             status: "Open a WAV, MP3, FLAC, or Ogg audio file to begin.".to_owned(),
             status_is_error: false,
             load_receiver: None,
+            load_cancel: None,
+            load_cancel_requested: false,
+            load_revision: 0,
             load_started: None,
             worker_sender: None,
             spectrogram_sender: None,
@@ -172,18 +208,30 @@ impl Default for SpectrimApp {
             preview_samples: None,
             preview_cache: PreviewCache::new(),
             preview_dirty: false,
+            fft_size: 2048,
+            fft_zoom_target: None,
+            detail_revision: 0,
+            detail_in_flight: false,
             last_edit: None,
             selections: Vec::new(),
             selected_selection: None,
             next_selection_id: 1,
             default_action: SelectionAction::Gain,
+            polygon_tool: false,
             spectrogram_view: SpectrogramView::default(),
+            pointer_coordinates: None,
+            visible_time_range: (0.0, 0.0),
+            export_dialog_open: false,
+            export_crop_silence: false,
         }
     }
 }
 
 impl SpectrimApp {
     fn start_load(&mut self, path: PathBuf) {
+        if let Some(cancel) = self.load_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
         self.playback.stop();
         self.is_playing = false;
         self.paused = false;
@@ -194,24 +242,39 @@ impl SpectrimApp {
         self.stop_worker();
 
         let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.load_cancel = Some(Arc::clone(&cancel));
+        self.load_cancel_requested = false;
+        self.load_revision = self.load_revision.wrapping_add(1);
+        let revision = self.load_revision;
         self.load_receiver = Some(receiver);
         self.load_started = Some(Instant::now());
         self.status = format!("Decoding {}…", path.display());
         self.status_is_error = false;
         thread::spawn(move || {
             let started = Instant::now();
-            let result = decode_file(&path)
+            let result = crate::audio::decode::decode_file_cancellable(&path, &cancel)
                 .map_err(|error| error.to_string())
                 .and_then(|audio| {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err("Loading cancelled".to_owned());
+                    }
                     let decode_time = started.elapsed();
-                    let _ = sender.send(LoadMessage::Progress(format!(
-                        "Decoded in {:.1}s; computing spectrogram…",
-                        decode_time.as_secs_f32()
-                    )));
+                    let _ = sender.send(LoadMessage::Progress(
+                        revision,
+                        format!(
+                            "Decoded in {:.1}s; computing spectrogram…",
+                            decode_time.as_secs_f32()
+                        ),
+                    ));
                     let source_audio = Arc::new(audio.source);
                     let audio = Arc::new(audio.editor);
                     let analysis_started = Instant::now();
-                    let spec = spectrogram::compute(&audio, 2048, 512);
+                    let hop = spectrogram_hop(audio.frame_count(), 2048);
+                    let Some(spec) = spectrogram::compute_cancellable(&audio, 2048, hop, &cancel)
+                    else {
+                        return Err("Loading cancelled".to_owned());
+                    };
                     let analysis_time = analysis_started.elapsed();
                     println!(
                         "Spectrogram: {} × {} in {:.2}s",
@@ -219,19 +282,29 @@ impl SpectrimApp {
                         spec.n_time,
                         analysis_time.as_secs_f32()
                     );
-                    let _ = sender.send(LoadMessage::Progress(format!(
-                        "Spectrogram ready in {:.1}s; preparing display…",
-                        analysis_time.as_secs_f32()
-                    )));
+                    let _ = sender.send(LoadMessage::Progress(
+                        revision,
+                        format!(
+                            "Spectrogram ready in {:.1}s; preparing display…",
+                            analysis_time.as_secs_f32()
+                        ),
+                    ));
                     let image_started = Instant::now();
-                    let image = crate::ui::spectrogram_view::color_image(&spec);
+                    let Some(image) =
+                        crate::ui::spectrogram_view::color_image_cancellable(&spec, &cancel)
+                    else {
+                        return Err("Loading cancelled".to_owned());
+                    };
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err("Loading cancelled".to_owned());
+                    }
                     println!(
                         "Display image prepared in {:.2}s",
                         image_started.elapsed().as_secs_f32()
                     );
                     Ok((path, source_audio, audio, spec, image))
                 });
-            let _ = sender.send(LoadMessage::Loaded(result));
+            let _ = sender.send(LoadMessage::Loaded(revision, result));
         });
     }
 
@@ -257,6 +330,8 @@ impl SpectrimApp {
                         samples,
                         channels,
                         sample_rate,
+                        n_fft,
+                        hop,
                         changed_frames,
                         revision,
                     } => {
@@ -264,8 +339,8 @@ impl SpectrimApp {
                             &samples,
                             channels,
                             sample_rate,
-                            2048,
-                            512,
+                            n_fft,
+                            hop,
                             changed_frames.0,
                             changed_frames.1,
                         );
@@ -276,17 +351,51 @@ impl SpectrimApp {
                         samples,
                         channels,
                         sample_rate,
+                        n_fft,
+                        hop,
                         revision,
                     } => {
                         let full = spectrogram::compute_interleaved(
                             &samples,
                             channels,
                             sample_rate,
-                            2048,
-                            512,
+                            n_fft,
+                            hop,
                         );
                         let _ = spectrogram_msg_tx
                             .send(WorkerMessage::SpectrogramRebuilt(revision, full));
+                    }
+                    SpectrogramJob::ViewDetail {
+                        samples,
+                        channels,
+                        sample_rate,
+                        time_range,
+                        n_fft,
+                        revision,
+                    } => {
+                        let channel_count = channels.max(1) as usize;
+                        let total_frames = samples.len() / channel_count;
+                        let padding = n_fft / 2;
+                        let first = ((time_range.0.max(0.0) * sample_rate as f32) as usize)
+                            .saturating_sub(padding);
+                        let last = ((time_range.1.max(0.0) * sample_rate as f32).ceil() as usize)
+                            .saturating_add(padding)
+                            .min(total_frames);
+                        let crop = &samples[first * channel_count..last * channel_count];
+                        let hop = spectrogram_hop(last.saturating_sub(first), n_fft);
+                        let detail = spectrogram::compute_interleaved(
+                            crop,
+                            channels,
+                            sample_rate,
+                            n_fft,
+                            hop,
+                        );
+                        let _ = spectrogram_msg_tx.send(WorkerMessage::ViewDetailReady(
+                            revision,
+                            first as f32 / sample_rate as f32,
+                            last as f32 / sample_rate as f32,
+                            detail,
+                        ));
                     }
                 }
             }
@@ -298,6 +407,8 @@ impl SpectrimApp {
                     WorkerJob::Preview {
                         audio,
                         selections,
+                        spectrogram_n_fft,
+                        spectrogram_hop,
                         revision,
                     } => {
                         let outcome: PreviewOutcome = cache.render(&audio, &selections);
@@ -306,22 +417,41 @@ impl SpectrimApp {
                         let _ = msg_tx.send(WorkerMessage::PreviewDone {
                             samples: Arc::new(cache.samples.clone()),
                             changed_frames: outcome.changed_frames,
-                            full_rebuild: outcome.full_rebuild,
                             revision,
                         });
                         if let Some(changed_frames) = outcome.changed_frames {
+                            let total_frames = audio.frame_count();
+                            let n_fft = spectrogram_n_fft;
+                            let hop = spectrogram_hop;
                             if outcome.full_rebuild {
                                 let _ = spectrogram_tx.send(SpectrogramJob::FullRebuild {
                                     samples: Arc::new(cache.samples.clone()),
                                     channels: audio.channels,
                                     sample_rate: audio.sample_rate,
+                                    n_fft,
+                                    hop,
                                     revision,
                                 });
                             } else {
+                                let n_total_time = if total_frames >= n_fft {
+                                    (total_frames - n_fft) / hop + 1
+                                } else {
+                                    0
+                                };
+                                let changed_frames = spectrogram::expanded_patch_frames(
+                                    changed_frames,
+                                    n_total_time,
+                                    total_frames,
+                                    n_fft,
+                                    hop,
+                                    8192,
+                                );
                                 let _ = spectrogram_tx.send(SpectrogramJob::PatchFromPcm {
                                     samples: Arc::new(cache.samples.clone()),
                                     channels: audio.channels,
                                     sample_rate: audio.sample_rate,
+                                    n_fft,
+                                    hop,
                                     changed_frames,
                                     revision,
                                 });
@@ -332,9 +462,17 @@ impl SpectrimApp {
                         audio,
                         selections,
                         path,
+                        crop_silence,
                     } => {
                         // Export stays exact: full STFT masking, not the IIR preview.
-                        let samples = apply_selections(&audio, &selections);
+                        let mut samples = apply_selections(&audio, &selections);
+                        if crop_silence {
+                            samples = crate::audio::process::trim_silence(
+                                &samples,
+                                audio.channels,
+                                0.001,
+                            );
+                        }
                         let result = export_wav(&path, &samples, audio.sample_rate, audio.channels)
                             .map_err(|error| format!("WAV export failed: {error}"));
                         let _ = msg_tx.send(WorkerMessage::ExportDone(result));
@@ -372,6 +510,11 @@ impl SpectrimApp {
             return;
         };
         let selections = self.selections.clone();
+        let (spectrogram_n_fft, spectrogram_hop) = self
+            .loaded
+            .as_ref()
+            .map(|loaded| (loaded.spectrogram.n_fft, loaded.spectrogram.hop_length))
+            .unwrap_or((2048, 512));
         self.preview_revision = self.preview_revision.wrapping_add(1);
         let revision = self.preview_revision;
         self.preview_dirty = true;
@@ -380,6 +523,8 @@ impl SpectrimApp {
             .send(WorkerJob::Preview {
                 audio,
                 selections,
+                spectrogram_n_fft,
+                spectrogram_hop,
                 revision,
             })
             .is_err()
@@ -398,10 +543,17 @@ impl SpectrimApp {
             .unwrap_or_default();
         for message in load_messages {
             match message {
-                LoadMessage::Progress(message) => self.status = message,
-                LoadMessage::Loaded(result) => {
+                LoadMessage::Progress(revision, message)
+                    if revision == self.load_revision && !self.load_cancel_requested =>
+                {
+                    self.status = message
+                }
+                LoadMessage::Progress(_, _) => {}
+                LoadMessage::Loaded(revision, result) if revision == self.load_revision => {
                     self.load_receiver = None;
                     self.load_started = None;
+                    self.load_cancel = None;
+                    self.load_cancel_requested = false;
                     match result {
                         Ok((path, source_audio, audio, spec, image)) => {
                             let texture = ctx.load_texture(
@@ -418,6 +570,8 @@ impl SpectrimApp {
                                 spectrogram: spec,
                                 texture,
                             });
+                            self.fft_size = 2048;
+                            self.fft_zoom_target = None;
                             self.playhead_time = 0.0;
                             self.spectrogram_view = SpectrogramView::default();
                             self.selections.clear();
@@ -426,11 +580,17 @@ impl SpectrimApp {
                             self.status.clear();
                         }
                         Err(error) => {
-                            self.status = error;
-                            self.status_is_error = true;
+                            if error == "Loading cancelled" {
+                                self.status.clear();
+                                self.status_is_error = false;
+                            } else {
+                                self.status = error;
+                                self.status_is_error = true;
+                            }
                         }
                     }
                 }
+                LoadMessage::Loaded(_, _) => {}
             }
         }
 
@@ -444,7 +604,6 @@ impl SpectrimApp {
                 WorkerMessage::PreviewDone {
                     samples,
                     changed_frames,
-                    full_rebuild,
                     revision,
                 } => {
                     if revision == self.preview_revision {
@@ -453,9 +612,9 @@ impl SpectrimApp {
                     if revision == self.preview_revision {
                         self.preview_dirty = false;
                         self.preview_samples = Some(Arc::clone(&samples));
-                        if changed_frames.is_some()
-                            && !self.completed_spectrogram_revisions.remove(&revision)
-                        {
+                        let fft_already_done =
+                            self.completed_spectrogram_revisions.remove(&revision);
+                        if changed_frames.is_some() && !fft_already_done {
                             self.pending_spectrogram_revisions.insert(revision);
                         }
 
@@ -463,10 +622,10 @@ impl SpectrimApp {
                         // the mixer, preserving its absolute frame position.
                         if self.processed_mode && self.is_playing && !self.paused {
                             self.playback.update_buffer(Arc::clone(&samples));
-                            if full_rebuild || changed_frames.is_some() {
-                                self.status.clear();
-                            }
-                        } else {
+                        }
+                        if changed_frames.is_some() && !fft_already_done {
+                            self.status = "Updating edited preview and FFT…".to_owned();
+                        } else if !self.export_in_flight {
                             self.status.clear();
                         }
                     }
@@ -504,6 +663,12 @@ impl SpectrimApp {
                             }
                         }
                     }
+                    if self.pending_spectrogram_revisions.is_empty()
+                        && !self.preview_in_flight
+                        && self.status.starts_with("Updating edited preview")
+                    {
+                        self.status.clear();
+                    }
                 }
                 WorkerMessage::SpectrogramRebuilt(revision, rebuilt) => {
                     if !self.pending_spectrogram_revisions.remove(&revision)
@@ -513,17 +678,30 @@ impl SpectrimApp {
                     }
                     if revision == self.preview_revision {
                         if let Some(loaded) = &mut self.loaded {
-                            if rebuilt.n_freq == loaded.spectrogram.n_freq
-                                && rebuilt.n_time == loaded.spectrogram.n_time
-                            {
-                                let image = crate::ui::spectrogram_view::color_image(&rebuilt);
-                                loaded.texture.set(image, egui::TextureOptions::LINEAR);
-                                loaded.spectrogram = rebuilt;
-                            }
+                            let image = crate::ui::spectrogram_view::color_image(&rebuilt);
+                            loaded.texture.set(image, egui::TextureOptions::LINEAR);
+                            loaded.spectrogram = rebuilt;
                         }
-                        if self.status == "Recalculating FFT…" {
+                        if self.pending_spectrogram_revisions.is_empty()
+                            && !self.preview_in_flight
+                            && (self.status.starts_with("Recalculating FFT")
+                                || self.status.starts_with("Updating edited preview"))
+                        {
                             self.status.clear();
                         }
+                    }
+                }
+                WorkerMessage::ViewDetailReady(revision, time_start, time_end, detail) => {
+                    if revision == self.detail_revision {
+                        self.detail_in_flight = false;
+                        let image = crate::ui::spectrogram_view::color_image(&detail);
+                        let texture = ctx.load_texture(
+                            "spectrogram-detail",
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.spectrogram_view
+                            .set_detail(texture, time_start, time_end);
                     }
                 }
                 WorkerMessage::ExportDone(result) => {
@@ -636,7 +814,7 @@ impl SpectrimApp {
         }
     }
 
-    fn export(&mut self, path: PathBuf) {
+    fn export(&mut self, path: PathBuf, crop_silence: bool) {
         let Some(audio) = self
             .loaded
             .as_ref()
@@ -657,6 +835,7 @@ impl SpectrimApp {
             audio,
             selections,
             path,
+            crop_silence,
         });
     }
 
@@ -671,6 +850,11 @@ impl SpectrimApp {
             return;
         };
         let samples = self.preview_samples.clone().unwrap_or(dry);
+        let n_fft = self.fft_size;
+        // Bound high-resolution matrix allocations on long recordings. This
+        // changes only display analysis density, never source PCM or exports.
+        let frames = samples.len() / (channels.max(1) as usize);
+        let hop = spectrogram_hop(frames, n_fft);
         self.start_worker();
         let Some(sender) = self.spectrogram_sender.clone() else {
             return;
@@ -680,18 +864,58 @@ impl SpectrimApp {
         self.completed_spectrogram_revisions.clear();
         let revision = self.preview_revision;
         self.pending_spectrogram_revisions.insert(revision);
-        self.status = "Recalculating FFT…".to_owned();
+        self.status = format!("Recalculating FFT ({n_fft}, hop {hop})…");
         self.status_is_error = false;
         if sender
             .send(SpectrogramJob::FullRebuild {
                 samples,
                 channels,
                 sample_rate,
+                n_fft,
+                hop,
                 revision,
             })
             .is_err()
         {
             self.pending_spectrogram_revisions.remove(&revision);
+            self.status = "FFT worker stopped unexpectedly.".to_owned();
+            self.status_is_error = true;
+        }
+    }
+
+    fn request_view_detail(&mut self, n_fft: usize, time_range: (f32, f32)) {
+        let Some((channels, sample_rate, dry)) = self.loaded.as_ref().map(|loaded| {
+            (
+                loaded.audio.channels,
+                loaded.audio.sample_rate,
+                Arc::clone(&loaded.dry_samples),
+            )
+        }) else {
+            return;
+        };
+        let samples = self.preview_samples.clone().unwrap_or(dry);
+        self.start_worker();
+        let Some(sender) = self.spectrogram_sender.clone() else {
+            return;
+        };
+        self.detail_revision = self.detail_revision.wrapping_add(1);
+        let revision = self.detail_revision;
+        self.detail_in_flight = true;
+        self.spectrogram_view.clear_detail();
+        self.status = "Computing zoomed FFT detail…".to_owned();
+        self.status_is_error = false;
+        if sender
+            .send(SpectrogramJob::ViewDetail {
+                samples,
+                channels,
+                sample_rate,
+                time_range,
+                n_fft,
+                revision,
+            })
+            .is_err()
+        {
+            self.detail_in_flight = false;
             self.status = "FFT worker stopped unexpectedly.".to_owned();
             self.status_is_error = true;
         }
@@ -706,12 +930,25 @@ impl SpectrimApp {
         self.preview_revision = self.preview_revision.wrapping_add(1);
         self.pending_spectrogram_revisions.clear();
         self.completed_spectrogram_revisions.clear();
-        if self.status == "Recalculating FFT…" || self.status.starts_with("Preview") {
+        if self.status.starts_with("Recalculating FFT")
+            || self.status.starts_with("Preview")
+            || self.status == "Computing zoomed FFT detail…"
+        {
             self.status.clear();
             self.status_is_error = false;
         }
         self.last_edit = Some(Instant::now());
         self.preview_dirty = true;
+        self.detail_revision = self.detail_revision.wrapping_add(1);
+        self.detail_in_flight = false;
+        self.spectrogram_view.clear_detail();
+        if self.visible_time_range.1 > self.visible_time_range.0 {
+            self.fft_zoom_target = Some((
+                self.fft_size.max(4096),
+                self.visible_time_range,
+                Instant::now(),
+            ));
+        }
     }
 
     /// Flush a pending debounced preview request.
@@ -747,6 +984,8 @@ impl eframe::App for SpectrimApp {
             || self.load_receiver.is_some()
             || self.preview_dirty
             || self.preview_in_flight
+            || self.detail_in_flight
+            || self.fft_zoom_target.is_some()
             || !self.pending_spectrogram_revisions.is_empty();
         let duration = self
             .loaded
@@ -794,15 +1033,25 @@ impl eframe::App for SpectrimApp {
                 }
                 ui.separator();
                 ui.label("New selection:");
+                ui.selectable_value(&mut self.default_action, SelectionAction::Gain, "Gain");
                 ui.selectable_value(&mut self.default_action, SelectionAction::Solo, "Solo")
                     .on_hover_text("Solo regions are combined as a union; while any Solo exists, Gain regions are ignored.");
-                ui.selectable_value(&mut self.default_action, SelectionAction::Gain, "Gain");
+                if ui
+                    .selectable_label(self.polygon_tool, "Polygon tool")
+                    .on_hover_text("Click to add vertices. Close by clicking the first point, double-clicking, or pressing Enter. Esc cancels. Drag vertices later to edit.")
+                    .clicked()
+                {
+                    self.polygon_tool = !self.polygon_tool;
+                    self.spectrogram_view.set_polygon_tool(self.polygon_tool);
+                }
                 if ui
                     .add_enabled(
                         self.loaded.is_some()
                             && !self.preview_dirty
                             && !self.preview_in_flight
                             && !self.export_in_flight
+                            && !self.detail_in_flight
+                            && self.fft_zoom_target.is_none()
                             && self.pending_spectrogram_revisions.is_empty(),
                         egui::Button::new("Recalculate FFT"),
                     )
@@ -817,13 +1066,8 @@ impl eframe::App for SpectrimApp {
                     )
                     .clicked()
                 {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("WAV", &["wav"])
-                        .set_file_name("edited.wav")
-                        .save_file()
-                    {
-                        self.export(path);
-                    }
+                    self.export_crop_silence = false;
+                    self.export_dialog_open = true;
                 }
             });
         });
@@ -832,8 +1076,16 @@ impl eframe::App for SpectrimApp {
             .default_width(280.0)
             .resizable(true)
             .show(ctx, |ui| {
-                let events =
-                    crate::ui::region_list::show(ui, &mut self.selections, self.selected_selection);
+                let nyquist = self
+                    .loaded
+                    .as_ref()
+                    .map_or(22_050.0, |loaded| loaded.audio.sample_rate as f32 * 0.5);
+                let events = crate::ui::region_list::show(
+                    ui,
+                    &mut self.selections,
+                    self.selected_selection,
+                    nyquist,
+                );
                 if let Some(selected) = events.selected {
                     self.selected_selection = selected;
                 }
@@ -857,6 +1109,11 @@ impl eframe::App for SpectrimApp {
                         "{:.2}s · {} Hz · {} channel(s)",
                         loaded.audio.duration, loaded.audio.sample_rate, loaded.audio.channels
                     ));
+                    if let Some((time, frequency)) = self.pointer_coordinates {
+                            ui.label(format!("· {time:.3}s · {frequency:.1} Hz"));
+                    } else {
+                            ui.label("· —");
+                    }
                 });
                 let events = self.spectrogram_view.show(
                     ui,
@@ -866,13 +1123,54 @@ impl eframe::App for SpectrimApp {
                     &mut self.selections,
                     self.selected_selection,
                     current_time,
+                    self.polygon_tool,
                 );
+                let visible_frequency_span = events.visible_ranges.3 - events.visible_ranges.2;
+                self.visible_time_range = (events.visible_ranges.0, events.visible_ranges.1);
+                let visible_time_span = events.visible_ranges.1 - events.visible_ranges.0;
+                let is_zoomed = visible_time_span < loaded.audio.duration * 0.75
+                    || visible_frequency_span < loaded.audio.sample_rate as f32 * 0.4;
+                let detail_time_range = if visible_time_span <= 120.0 {
+                    (events.visible_ranges.0, events.visible_ranges.1)
+                } else {
+                    let visible_center = if current_time >= events.visible_ranges.0
+                        && current_time <= events.visible_ranges.1
+                    {
+                        current_time
+                    } else {
+                        (events.visible_ranges.0 + events.visible_ranges.1) * 0.5
+                    };
+                    (
+                        (visible_center - 60.0).max(events.visible_ranges.0),
+                        (visible_center + 60.0).min(events.visible_ranges.1),
+                    )
+                };
+                let suggested_fft = if visible_frequency_span <= 2_800.0 {
+                    8_192
+                } else if visible_frequency_span <= 5_600.0 {
+                    4_096
+                } else {
+                    2_048
+                };
+                if events.view_changed && is_zoomed {
+                    self.detail_revision = self.detail_revision.wrapping_add(1);
+                    self.detail_in_flight = false;
+                    self.spectrogram_view.clear_detail();
+                    let target = (suggested_fft, detail_time_range);
+                    self.fft_zoom_target = Some((target.0, target.1, Instant::now()));
+                } else if !is_zoomed {
+                    self.fft_zoom_target = None;
+                    self.detail_revision = self.detail_revision.wrapping_add(1);
+                    self.detail_in_flight = false;
+                    self.spectrogram_view.clear_detail();
+                }
                 if let Some(selected) = events.selected {
                     self.selected_selection = selected;
                 }
                 if events.selections_changed {
                     selections_modified = true;
                 }
+                self.pointer_coordinates = events.pointer_coordinates;
                 if events.drag_started {
                     self.plot_drag_active = true;
                     if self.is_playing {
@@ -903,6 +1201,16 @@ impl eframe::App for SpectrimApp {
                     self.next_selection_id += 1;
                     selections_modified = true;
                 }
+                if let Some(points) = events.created_polygon {
+                    self.selections.push(Selection::polygon(
+                        self.next_selection_id,
+                        points,
+                        self.default_action,
+                    ));
+                    self.selected_selection = Some(self.next_selection_id);
+                    self.next_selection_id += 1;
+                    selections_modified = true;
+                }
                 if let Some(id) = events.deleted {
                     self.selections.retain(|selection| selection.id != id);
                     if self.selected_selection == Some(id) {
@@ -920,6 +1228,50 @@ impl eframe::App for SpectrimApp {
             self.selections_changed();
         }
 
+        if self.export_dialog_open {
+            let modal = egui::Modal::new(egui::Id::new("export_options_modal")).show(ctx, |ui| {
+                    ui.set_min_width(300.0);
+                    ui.heading("Export WAV");
+                    ui.checkbox(&mut self.export_crop_silence, "裁剪处理后音频的首尾静音");
+                    ui.label("静音阈值：-60 dBFS。其他导出选项可在此继续添加。");
+                    ui.horizontal(|ui| {
+                        let confirm = ui.button("选择路径并导出…").clicked();
+                        let cancel = ui.button("取消").clicked();
+                        (confirm, cancel)
+                    })
+                    .inner
+                });
+            let (confirm, cancel) = modal.inner;
+            if cancel || modal.should_close() {
+                self.export_dialog_open = false;
+            } else if confirm {
+                self.export_dialog_open = false;
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("WAV", &["wav"])
+                    .set_file_name("edited.wav")
+                    .save_file()
+                {
+                    self.export(path, self.export_crop_silence);
+                }
+            }
+        }
+
+        if let Some((target_fft, time_range, since)) = self.fft_zoom_target {
+            if since.elapsed() >= Duration::from_millis(400)
+                && !self.preview_dirty
+                && !self.preview_in_flight
+                && self.pending_spectrogram_revisions.is_empty()
+                && !self.export_in_flight
+                && self.loaded.is_some()
+            {
+                self.fft_size = target_fft;
+                self.fft_zoom_target = None;
+                self.request_view_detail(target_fft, time_range);
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+        }
+
         egui::TopBottomPanel::bottom("status_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if self.load_receiver.is_some() {
@@ -932,8 +1284,17 @@ impl eframe::App for SpectrimApp {
                     } else if !self.status.is_empty() {
                         ui.label(&self.status);
                     }
+                    if ui.button("Cancel load").clicked() {
+                        if let Some(cancel) = &self.load_cancel {
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                        self.load_cancel_requested = true;
+                        self.status = "Cancelling load…".to_owned();
+                    }
                 } else if processing {
-                    if !self.status.is_empty() {
+                    if self.fft_zoom_target.is_some() {
+                        ui.label("Adjusting FFT resolution for zoom…");
+                    } else if !self.status.is_empty() {
                         ui.label(&self.status);
                     }
                 } else if self.status_is_error {
@@ -951,6 +1312,8 @@ impl eframe::App for SpectrimApp {
         if self.export_in_flight
             || self.load_receiver.is_some()
             || self.preview_in_flight
+            || self.detail_in_flight
+            || self.fft_zoom_target.is_some()
             || !self.pending_spectrogram_revisions.is_empty()
         {
             ctx.request_repaint_after(Duration::from_millis(30));

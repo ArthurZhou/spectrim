@@ -86,6 +86,12 @@ pub enum SelectionAction {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum SelectionShape {
+    Rect,
+    Polygon { points: Vec<(f32, f32)> },
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Selection {
     pub id: u64,
     pub time_start: f32,
@@ -93,12 +99,42 @@ pub struct Selection {
     pub freq_low: f32,
     pub freq_high: f32,
     pub action: SelectionAction,
+    pub enabled: bool,
     /// Linear gain multiplier used by `Gain` and `Solo` selections.
     pub gain: f32,
     pub full_band: bool,
+    pub shape: SelectionShape,
 }
 
 impl Selection {
+    pub fn is_polygon(&self) -> bool {
+        matches!(self.shape, SelectionShape::Polygon { .. })
+    }
+
+    pub fn refresh_bounds(&mut self) {
+        if let SelectionShape::Polygon { points } = &self.shape {
+            if points.is_empty() {
+                return;
+            }
+            self.time_start = points
+                .iter()
+                .map(|point| point.0)
+                .fold(f32::INFINITY, f32::min);
+            self.time_end = points
+                .iter()
+                .map(|point| point.0)
+                .fold(f32::NEG_INFINITY, f32::max);
+            self.freq_low = points
+                .iter()
+                .map(|point| point.1)
+                .fold(f32::INFINITY, f32::min);
+            self.freq_high = points
+                .iter()
+                .map(|point| point.1)
+                .fold(f32::NEG_INFINITY, f32::max);
+        }
+    }
+
     pub fn new(
         id: u64,
         time_a: f32,
@@ -115,8 +151,41 @@ impl Selection {
             freq_low: freq_a.min(freq_b),
             freq_high: freq_a.max(freq_b),
             action,
+            enabled: true,
             gain: 0.5,
             full_band,
+            shape: SelectionShape::Rect,
+        }
+    }
+
+    pub fn polygon(id: u64, points: Vec<(f32, f32)>, action: SelectionAction) -> Self {
+        let time_start = points
+            .iter()
+            .map(|point| point.0)
+            .fold(f32::INFINITY, f32::min);
+        let time_end = points
+            .iter()
+            .map(|point| point.0)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let freq_low = points
+            .iter()
+            .map(|point| point.1)
+            .fold(f32::INFINITY, f32::min);
+        let freq_high = points
+            .iter()
+            .map(|point| point.1)
+            .fold(f32::NEG_INFINITY, f32::max);
+        Self {
+            id,
+            time_start,
+            time_end,
+            freq_low,
+            freq_high,
+            action,
+            enabled: true,
+            gain: 0.5,
+            full_band: false,
+            shape: SelectionShape::Polygon { points },
         }
     }
 }
