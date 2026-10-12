@@ -260,7 +260,7 @@ fn compute_mono(mono: &[f32], sample_rate: u32, n_fft: usize, hop: usize) -> Spe
 /// tracks. A fixed-bin histogram reduced in parallel gives the same percentiles
 /// for colour-mapping purposes in O(n), which is plenty accurate here: the
 /// values only drive a normalisation range, not audio.
-fn compute_db_range(matrix: &[f32]) -> (f32, f32) {
+pub(crate) fn compute_db_range(matrix: &[f32]) -> (f32, f32) {
     const BINS: usize = 4096;
     if matrix.is_empty() {
         return (0.0, 0.0);

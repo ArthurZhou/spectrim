@@ -12,6 +12,12 @@ use symphonia::core::probe::Hint;
 
 use super::types::AudioData;
 
+/// Original-rate audio for export plus the 44.1 kHz, stereo-limited editor copy.
+pub struct DecodedAudio {
+    pub source: AudioData,
+    pub editor: AudioData,
+}
+
 #[derive(Debug)]
 pub enum DecodeError {
     Io(std::io::Error),
@@ -37,7 +43,7 @@ impl From<std::io::Error> for DecodeError {
     }
 }
 
-pub fn decode_file(path: &Path) -> Result<AudioData, DecodeError> {
+pub fn decode_file(path: &Path) -> Result<DecodedAudio, DecodeError> {
     let file = File::open(path)?;
     let source = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
@@ -75,7 +81,7 @@ pub fn decode_file(path: &Path) -> Result<AudioData, DecodeError> {
     if let Some(frames) = estimated_frames {
         let estimate = usize::try_from(frames)
             .ok()
-            .and_then(|frames| frames.checked_mul(source_channels.min(2)));
+            .and_then(|frames| frames.checked_mul(source_channels));
         if let Some(sample_count) = estimate {
             // Avoid repeated Vec growth for formats that advertise their frame count.
             // Cap eager reservation at six hours; longer tracks still grow normally.
@@ -118,17 +124,7 @@ pub fn decode_file(path: &Path) -> Result<AudioData, DecodeError> {
         let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
         buffer.copy_interleaved_ref(decoded);
         let decoded = buffer.samples();
-        let output_channels = source_channels.min(2);
-        if output_channels == source_channels {
-            decoded_samples.extend(decoded.iter().map(|sample| sample.clamp(-1.0, 1.0)));
-        } else {
-            decoded_samples.extend(
-                decoded
-                    .chunks_exact(source_channels)
-                    .flat_map(|frame| frame[..output_channels].iter())
-                    .map(|sample| sample.clamp(-1.0, 1.0)),
-            );
-        }
+        decoded_samples.extend(decoded.iter().map(|sample| sample.clamp(-1.0, 1.0)));
     }
 
     if decoded_samples.is_empty() || source_rate == 0 || source_channels == 0 {
@@ -137,20 +133,51 @@ pub fn decode_file(path: &Path) -> Result<AudioData, DecodeError> {
         ));
     }
 
-    let channels = source_channels.min(2) as u16;
-    let samples = if source_rate == 44_100 {
-        decoded_samples
+    let source_channels = u16::try_from(source_channels).map_err(|_| {
+        DecodeError::DecodeFailure("audio channel count exceeds WAV limits".to_owned())
+    })?;
+    let source_duration =
+        decoded_samples.len() as f32 / source_channels as f32 / source_rate as f32;
+    let source = AudioData {
+        samples: decoded_samples,
+        sample_rate: source_rate,
+        channels: source_channels,
+        duration: source_duration,
+    };
+
+    // Keep the source-rate PCM untouched for export. The editor uses a
+    // stereo-limited 44.1 kHz copy for predictable preview/filter behavior.
+    let editor_channels = source.channels.min(2);
+    let editor_source_samples = if editor_channels == source.channels {
+        source.samples.clone()
     } else {
-        resample_linear(&decoded_samples, channels as usize, source_rate, 44_100)
+        source
+            .samples
+            .chunks_exact(source.channels as usize)
+            .flat_map(|frame| frame[..editor_channels as usize].iter().copied())
+            .collect()
+    };
+    let samples = if source.sample_rate == 44_100 {
+        editor_source_samples
+    } else {
+        resample_linear(
+            &editor_source_samples,
+            editor_channels as usize,
+            source.sample_rate,
+            44_100,
+        )
     };
     let sample_rate = 44_100;
-    let duration = samples.len() as f32 / channels as f32 / sample_rate as f32;
+    let duration = samples.len() as f32 / editor_channels as f32 / sample_rate as f32;
 
-    Ok(AudioData {
-        samples,
-        sample_rate,
-        channels,
-        duration,
+    Ok(DecodedAudio {
+        source,
+        editor: AudioData {
+            samples,
+            sample_rate,
+            channels: editor_channels,
+            duration,
+        },
     })
 }
 
@@ -181,4 +208,27 @@ fn resample_linear(
             }
         });
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resample_linear;
+
+    #[test]
+    fn editor_resampling_keeps_duration_and_stereo_layout() {
+        let source_rate = 48_000;
+        let target_rate = 44_100;
+        let frames = source_rate as usize;
+        let samples = (0..frames)
+            .flat_map(|frame| {
+                let sample = frame as f32 / frames as f32;
+                [sample, -sample]
+            })
+            .collect::<Vec<_>>();
+
+        let converted = resample_linear(&samples, 2, source_rate, target_rate);
+
+        assert_eq!(converted.len() / 2, target_rate as usize);
+        assert!(converted.chunks_exact(2).all(|frame| frame[0] == -frame[1]));
+    }
 }

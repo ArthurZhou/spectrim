@@ -636,6 +636,7 @@ pub fn color_image(spectrogram: &Spectrogram) -> egui::ColorImage {
 
 /// Convert changed STFT columns into a texture patch, retaining the original
 /// spectrogram's fixed dB range so pixel colors match unchanged columns.
+#[allow(dead_code)]
 pub fn color_image_patch(
     patch: &SpectrogramPatch,
     n_total_time: usize,
