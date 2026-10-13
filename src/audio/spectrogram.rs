@@ -200,6 +200,16 @@ pub fn compute_interleaved_patch(
     }
 }
 
+pub fn build_peak_map_for_spectrogram(spectrogram: &Spectrogram) -> Vec<Vec<usize>> {
+    let floor = spectrogram.db_min - 40.0;
+    build_peak_map(
+        &spectrogram.matrix,
+        spectrogram.n_freq,
+        spectrogram.n_time,
+        floor,
+    )
+}
+
 fn mono_from_interleaved(samples: &[f32], channels: u16) -> Cow<'_, [f32]> {
     let channel_count = channels as usize;
     if channel_count == 0 {
@@ -239,6 +249,7 @@ fn compute_mono_inner(
             sample_rate,
             db_min: 0.0,
             db_max: 0.0,
+            peaks: Vec::new(),
         });
     }
 
@@ -290,6 +301,9 @@ fn compute_mono_inner(
         });
 
     let (db_min, db_max) = compute_db_range(&matrix);
+    // Keep a bounded peak set so sensitivity can move the threshold down from
+    // the default without retaining every noise local-maximum in memory.
+    let peaks = build_peak_map(&matrix, n_freq, n_time, db_min - 40.0);
     Some(Spectrogram {
         matrix,
         n_freq,
@@ -299,7 +313,216 @@ fn compute_mono_inner(
         sample_rate,
         db_min,
         db_max,
+        peaks,
     })
+}
+
+pub(crate) fn build_peak_map(
+    matrix: &[f32],
+    n_freq: usize,
+    n_time: usize,
+    threshold_db: f32,
+) -> Vec<Vec<usize>> {
+    (0..n_time)
+        .into_par_iter()
+        .map(|time| {
+            if n_freq < 3 {
+                return Vec::new();
+            }
+            let mut peaks = Vec::new();
+            for frequency in 1..n_freq - 1 {
+                let value = matrix[frequency * n_time + time];
+                if value >= threshold_db
+                    && value > matrix[(frequency - 1) * n_time + time]
+                    && value > matrix[(frequency + 1) * n_time + time]
+                {
+                    peaks.push(frequency);
+                }
+            }
+            peaks
+        })
+        .collect()
+}
+
+pub(crate) fn rebuild_peak_map(spectrogram: &mut Spectrogram, floor_offset_db: f32) {
+    spectrogram.peaks = build_peak_map(
+        &spectrogram.matrix,
+        spectrogram.n_freq,
+        spectrogram.n_time,
+        spectrogram.db_min + floor_offset_db,
+    );
+}
+
+pub(crate) fn rasterize_stored_mask(
+    first_source_frame: usize,
+    source_ranges: &[(usize, usize)],
+    source_sample_rate: u32,
+    source_hop: usize,
+    source_n_fft: usize,
+    target_frames: usize,
+    target_freq_bins: usize,
+    target_sample_rate: u32,
+    target_hop: usize,
+    target_n_fft: usize,
+) -> Vec<Vec<(usize, usize)>> {
+    if source_ranges.is_empty()
+        || target_frames == 0
+        || target_freq_bins == 0
+        || source_sample_rate == 0
+        || target_sample_rate == 0
+    {
+        return Vec::new();
+    }
+    (0..target_frames)
+        .map(|target_frame| {
+            let time = target_frame as f64 * target_hop as f64 / target_sample_rate as f64;
+            let source_position = time * source_sample_rate as f64 / source_hop.max(1) as f64;
+            let source_index = source_position.round() as isize - first_source_frame as isize;
+            if source_index < 0 || source_index as usize >= source_ranges.len() {
+                return Vec::new();
+            }
+            let (source_low, source_high) = source_ranges[source_index as usize];
+            let hz_per_source_bin = source_sample_rate as f64 / source_n_fft.max(1) as f64;
+            let hz_low = source_low as f64 * hz_per_source_bin;
+            let hz_high = (source_high + 1) as f64 * hz_per_source_bin;
+            let first_bin =
+                (hz_low * target_n_fft as f64 / target_sample_rate as f64).ceil() as usize;
+            let last_bin = ((hz_high * target_n_fft as f64 / target_sample_rate as f64).floor()
+                - 1.0)
+                .max(0.0) as usize;
+            let last_bin = last_bin.min(target_freq_bins.saturating_sub(1));
+            if first_bin <= last_bin && first_bin < target_freq_bins {
+                vec![(first_bin, last_bin)]
+            } else {
+                Vec::new()
+            }
+        })
+        .collect()
+}
+
+/// Grow a peak seed into a variable-width mask by tracking nearby frame peaks
+/// and expanding each row to valleys. `max_valley_crossings=1` selects one lobe.
+pub fn grow_peak_mask(
+    spectrogram: &Spectrogram,
+    time: f32,
+    frequency_hz: f32,
+    sensitivity_db: f32,
+    max_valley_crossings: usize,
+) -> Option<(usize, Vec<(usize, usize)>)> {
+    if spectrogram.peaks.is_empty() || spectrogram.n_freq < 3 {
+        return None;
+    }
+    let hover_frame = (time * spectrogram.sample_rate as f32 / spectrogram.hop_length.max(1) as f32)
+        .round() as usize;
+    let hover_frame = hover_frame.min(spectrogram.n_time.saturating_sub(1));
+    let hover_bin = spectrogram.hz_to_bin(frequency_hz);
+    let min_frame = hover_frame.saturating_sub(4);
+    let max_frame = hover_frame
+        .saturating_add(4)
+        .min(spectrogram.n_time.saturating_sub(1));
+    // Larger UI sensitivity lowers the threshold and grows a larger region.
+    let threshold = spectrogram.db_min + (30.0 - sensitivity_db.clamp(0.0, 45.0));
+
+    let seed = (min_frame..=max_frame)
+        .flat_map(|frame| {
+            spectrogram
+                .peaks
+                .get(frame)
+                .into_iter()
+                .flatten()
+                .map(move |&bin| {
+                    let value = spectrogram.at(bin, frame);
+                    (frame, bin, value)
+                })
+        })
+        .filter(|(_, _, value)| *value >= threshold)
+        .min_by_key(|(frame, bin, _)| frame.abs_diff(hover_frame) * 2 + bin.abs_diff(hover_bin))?;
+
+    let track = |direction: isize| -> Vec<(usize, usize)> {
+        let mut result = Vec::new();
+        let mut frame = seed.0 as isize;
+        let mut center = seed.1;
+        loop {
+            frame += direction;
+            if frame < 0 || frame >= spectrogram.n_time as isize {
+                break;
+            }
+            let frame = frame as usize;
+            let Some(candidates) = spectrogram.peaks.get(frame) else {
+                break;
+            };
+            let next = candidates
+                .iter()
+                .copied()
+                .filter(|bin| bin.abs_diff(center) <= (center / 16).max(8))
+                .max_by(|a, b| {
+                    spectrogram
+                        .at(*a, frame)
+                        .total_cmp(&spectrogram.at(*b, frame))
+                });
+            let Some(next) = next else { break };
+            if spectrogram.at(next, frame) < threshold {
+                break;
+            }
+            center = next;
+            result.push((frame, center));
+        }
+        result
+    };
+    let left = track(-1);
+    let right = track(1);
+    let first_frame = left.last().map_or(seed.0, |point| point.0);
+    let last_frame = right.last().map_or(seed.0, |point| point.0);
+    let mut centers = vec![seed.1; last_frame - first_frame + 1];
+    centers[seed.0 - first_frame] = seed.1;
+    for (frame, bin) in left.into_iter().chain(right) {
+        centers[frame - first_frame] = bin;
+    }
+
+    let max_crossings = max_valley_crossings.clamp(1, 8);
+    let mut ranges = Vec::with_capacity(centers.len());
+    for (offset, center) in centers.iter().copied().enumerate() {
+        let frame = first_frame + offset;
+        let row = &spectrogram.matrix;
+        let mut low = center;
+        let mut high = center;
+        let mut low_valleys = 0;
+        let mut high_valleys = 0;
+        let max_half_width = (spectrogram.n_freq / 8).max(16);
+        while low > 0 && center - low < max_half_width && low_valleys < max_crossings {
+            let candidate = low - 1;
+            let value = row[candidate * spectrogram.n_time + frame];
+            if candidate > 0
+                && value <= row[(candidate - 1) * spectrogram.n_time + frame]
+                && value <= row[(candidate + 1) * spectrogram.n_time + frame]
+            {
+                low_valleys += 1;
+            }
+            low = candidate;
+            if value < threshold && low_valleys >= max_crossings {
+                break;
+            }
+        }
+        while high + 1 < spectrogram.n_freq
+            && high - center < max_half_width
+            && high_valleys < max_crossings
+        {
+            let candidate = high + 1;
+            let value = row[candidate * spectrogram.n_time + frame];
+            if candidate + 1 < spectrogram.n_freq
+                && value <= row[(candidate - 1) * spectrogram.n_time + frame]
+                && value <= row[(candidate + 1) * spectrogram.n_time + frame]
+            {
+                high_valleys += 1;
+            }
+            high = candidate;
+            if value < threshold && high_valleys >= max_crossings {
+                break;
+            }
+        }
+        ranges.push((low, high));
+    }
+    Some((first_frame, ranges))
 }
 
 /// 5th/95th percentile of the dB distribution, used to normalise the colormap.
@@ -419,6 +642,34 @@ mod tests {
             .unwrap();
         let peak_hz = spec.bin_to_hz(peak_bin);
         assert!((peak_hz - 440.0).abs() < 40.0, "peak at {peak_hz} Hz");
+    }
+
+    #[test]
+    fn peak_mask_sensitivity_is_monotonic() {
+        let sample_rate = 8_000;
+        let frames = 16_000;
+        let audio = AudioData {
+            samples: (0..frames)
+                .map(|index| {
+                    let time = index as f32 / sample_rate as f32;
+                    let envelope = if time < 0.3 {
+                        time / 0.3
+                    } else if time > 1.2 {
+                        ((1.6 - time) / 0.4).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    envelope * (2.0 * std::f32::consts::PI * 1_000.0 * time).sin()
+                })
+                .collect(),
+            sample_rate,
+            channels: 1,
+            duration: frames as f32 / sample_rate as f32,
+        };
+        let spec = compute(&audio, 1024, 128);
+        let low = grow_peak_mask(&spec, 0.8, 1_000.0, 0.0, 1).unwrap();
+        let high = grow_peak_mask(&spec, 0.8, 1_000.0, 45.0, 1).unwrap();
+        assert!(high.1.len() >= low.1.len());
     }
 
     #[test]

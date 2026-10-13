@@ -16,6 +16,7 @@ use rayon::prelude::*;
 use rustfft::num_complex::Complex32;
 use rustfft::FftPlanner;
 
+use super::spectrogram::rasterize_stored_mask;
 use super::types::{hann_window, AudioData, Selection, SelectionAction, SelectionShape};
 
 pub fn apply_selections(audio: &AudioData, selections: &[Selection]) -> Vec<f32> {
@@ -32,7 +33,7 @@ pub fn apply_selections(audio: &AudioData, selections: &[Selection]) -> Vec<f32>
     }
     if selections
         .iter()
-        .all(|selection| selection.full_band && !selection.is_polygon())
+        .all(|selection| selection.full_band && !selection.requires_spectral_processing())
     {
         apply_time_domain(audio, selections)
     } else {
@@ -74,7 +75,10 @@ pub fn apply_time_domain(audio: &AudioData, selections: &[Selection]) -> Vec<f32
     if enabled.len() != selections.len() {
         return apply_time_domain(audio, &enabled);
     }
-    if selections.iter().any(Selection::is_polygon) {
+    if selections
+        .iter()
+        .any(Selection::requires_spectral_processing)
+    {
         return apply_spectral_masks(audio, selections, 2048, 512);
     }
     let channels = audio.channels as usize;
@@ -161,7 +165,7 @@ fn resolve(selection: &Selection, _sample_rate: f32) -> ResolvedRegion {
         full_band: selection.full_band,
         freq_low: selection.freq_low,
         freq_high: selection.freq_high,
-        gain: selection.gain.clamp(0.0, 4.0),
+        gain: selection.gain_linear(),
     }
 }
 
@@ -333,7 +337,10 @@ pub fn apply_spectral_masks(
     }
     let input_frames = audio.frame_count();
     if input_frames < n_fft {
-        if selections.iter().any(Selection::is_polygon) {
+        if selections
+            .iter()
+            .any(Selection::requires_spectral_processing)
+        {
             return audio.samples.clone();
         }
         return apply_time_domain(audio, selections);
@@ -367,6 +374,27 @@ pub fn apply_spectral_masks(
                     hop,
                     sample_rate,
                 )),
+                SelectionShape::Mask {
+                    first_frame,
+                    ranges,
+                    sample_rate: source_rate,
+                    hop_length: source_hop,
+                    n_fft: source_fft,
+                } => {
+                    let rasterized = rasterize_stored_mask(
+                        *first_frame,
+                        ranges,
+                        *source_rate,
+                        *source_hop,
+                        *source_fft,
+                        n_time,
+                        n_freq,
+                        audio.sample_rate,
+                        hop,
+                        n_fft,
+                    );
+                    MaskBins::Polygon(rasterized.get(frames.0..=frames.1).unwrap_or(&[]).to_vec())
+                }
             };
             Some(MaskRegion {
                 action: region.action,
@@ -544,7 +572,7 @@ mod tests {
     fn zero_gain_and_solo_are_applied() {
         let audio = sample_audio();
         let mut gain = Selection::new(1, 0.5, 1.0, 0.0, 500.0, SelectionAction::Gain, true);
-        gain.gain = 0.0;
+        gain.gain_db = -60.0;
         let zeroed = apply_time_domain(&audio, &[gain]);
         assert!(zeroed[500..1000].iter().all(|sample| *sample == 0.0));
         assert!(zeroed[0..400].iter().any(|sample| *sample != 0.0));
@@ -556,9 +584,10 @@ mod tests {
     }
 
     #[test]
-    fn gain_region_applies_linear_multiplier() {
+    fn gain_region_applies_db_converted_multiplier() {
         let audio = sample_audio();
-        let gain = Selection::new(1, 0.5, 1.0, 0.0, 500.0, SelectionAction::Gain, true);
+        let mut gain = Selection::new(1, 0.5, 1.0, 0.0, 500.0, SelectionAction::Gain, true);
+        gain.gain_db = 20.0 * 0.5_f32.log10();
         let output = apply_time_domain(&audio, &[gain]);
         for (index, sample) in output.iter().enumerate().take(1000).skip(500) {
             assert!((*sample - audio.samples[index] * 0.5).abs() < 1.0e-6);
@@ -570,7 +599,7 @@ mod tests {
     fn spectral_processing_preserves_length_and_finite_values() {
         let audio = sample_audio();
         let mut gain = Selection::new(1, 0.2, 1.5, 50.0, 200.0, SelectionAction::Gain, false);
-        gain.gain = 0.0;
+        gain.gain_db = -60.0;
         let output = apply_spectral_masks(&audio, &[gain], 256, 64);
         assert_eq!(output.len(), audio.samples.len());
         assert!(output.iter().all(|sample| sample.is_finite()));
@@ -598,7 +627,7 @@ mod tests {
             SelectionAction::Gain,
         );
         let mut polygon = polygon;
-        polygon.gain = 0.0;
+        polygon.gain_db = -60.0;
         let output = apply_selections(&audio, &[polygon]);
         assert_eq!(output.len(), audio.samples.len());
         assert!(output.iter().all(|sample| sample.is_finite()));
@@ -614,6 +643,38 @@ mod tests {
             (original_rms(&output[outside.clone()]) - original_rms(&audio.samples[outside])).abs()
                 < 2.0e-2
         );
+    }
+
+    #[test]
+    fn stored_mask_attenuates_only_its_time_frequency_region() {
+        let sample_rate = 8_000;
+        let frames = 16_000;
+        let audio = AudioData {
+            samples: (0..frames)
+                .map(|index| {
+                    (2.0 * std::f32::consts::PI * 1_000.0 * index as f32 / sample_rate as f32).sin()
+                })
+                .collect(),
+            sample_rate,
+            channels: 1,
+            duration: frames as f32 / sample_rate as f32,
+        };
+        let mut mask = Selection::mask(
+            7,
+            4,
+            vec![(255, 257); 9],
+            512,
+            sample_rate,
+            2048,
+            SelectionAction::Gain,
+        );
+        mask.gain_db = f32::NEG_INFINITY;
+        let output = apply_selections(&audio, &[mask]);
+        let rms = |samples: &[f32]| {
+            (samples.iter().map(|value| value * value).sum::<f32>() / samples.len() as f32).sqrt()
+        };
+        assert!(rms(&output[4_500..6_000]) < rms(&audio.samples[4_500..6_000]) * 0.5);
+        assert!((rms(&output[10_000..12_000]) - rms(&audio.samples[10_000..12_000])).abs() < 1e-3);
     }
 
     /// The precomputed frame/bin ranges must reproduce the current per-bin
@@ -674,7 +735,7 @@ mod tests {
                                 .iter()
                                 .filter(|s| s.action == SelectionAction::Gain)
                                 .filter(|s| in_bounds(s))
-                                .map(|s| s.gain.clamp(0.0, 4.0))
+                                .map(Selection::gain_linear)
                                 .product::<f32>()
                         };
                         spectrum[bin] *= gain;
@@ -755,7 +816,7 @@ mod tests {
             Selection::new(2, 0.3, 0.9, 100.0, 3_000.0, SelectionAction::Gain, false),
         ];
         let mut selections = selections;
-        selections[1].gain = 1.5;
+        selections[1].gain_db = 20.0 * 1.5_f32.log10();
         let got = apply_spectral_masks(&audio, &selections, 256, 64);
         let solo_only = apply_spectral_masks(&audio, &selections[..1], 256, 64);
         assert_eq!(got, solo_only);
@@ -775,7 +836,7 @@ mod tests {
             SelectionAction::Gain,
             false,
         );
-        selection.gain = 0.0;
+        selection.gain_db = -60.0;
         let selections = vec![selection];
         let got = apply_spectral_masks(&audio, &selections, 256, 64);
         let want = reference_masks(&audio, &selections, 256, 64);
@@ -817,13 +878,13 @@ mod tests {
         let audio = noisy_audio(20_000, 44_100, 2);
         let mut zero_gain_region =
             Selection::new(1, 0.05, 0.2, 0.0, 20_000.0, SelectionAction::Gain, true);
-        zero_gain_region.gain = 0.0;
+        zero_gain_region.gain_db = -60.0;
         let selections = vec![
             zero_gain_region,
             Selection::new(2, 0.1, 0.35, 0.0, 20_000.0, SelectionAction::Gain, true),
         ];
         let mut selections = selections;
-        selections[1].gain = 0.25;
+        selections[1].gain_db = 20.0 * 0.25_f32.log10();
         let got = apply_time_domain(&audio, &selections);
 
         // Sequential reference.
@@ -833,7 +894,7 @@ mod tests {
             let time = frame_index as f32 / audio.sample_rate as f32;
             let gain_zero = time >= selections[0].time_start && time <= selections[0].time_end;
             let gain = if time >= selections[1].time_start && time <= selections[1].time_end {
-                selections[1].gain
+                selections[1].gain_linear()
             } else {
                 1.0
             };

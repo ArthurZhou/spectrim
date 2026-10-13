@@ -180,7 +180,7 @@ fn render_time_domain(
                 action: s.action,
                 start,
                 end,
-                gain: s.gain.clamp(0.0, 4.0),
+                gain: s.gain_linear(),
             }
         })
         .collect();
@@ -286,7 +286,7 @@ fn render_range(
                         action: s.action,
                         start,
                         end,
-                        gain: s.gain.clamp(0.0, 4.0),
+                        gain: s.gain_linear(),
                         band,
                     }
                 })
@@ -382,7 +382,10 @@ pub fn render_full(audio: &AudioData, selections: &[Selection]) -> Vec<f32> {
     if channels == 0 || audio.samples.is_empty() || selections.is_empty() {
         return audio.samples.clone();
     }
-    if selections.iter().any(Selection::is_polygon) {
+    if selections
+        .iter()
+        .any(Selection::requires_spectral_processing)
+    {
         return apply_spectral_masks(audio, selections, 2048, 512);
     }
     if selections.iter().all(|s| s.full_band) {
@@ -427,8 +430,13 @@ impl PreviewCache {
         let channels = audio.channels as usize;
         let frames = audio.frame_count();
 
-        if selections.iter().any(Selection::is_polygon)
-            || self.selections.iter().any(Selection::is_polygon)
+        if selections
+            .iter()
+            .any(Selection::requires_spectral_processing)
+            || self
+                .selections
+                .iter()
+                .any(Selection::requires_spectral_processing)
         {
             self.samples = render_full(audio, selections);
             self.selections = selections.to_vec();
@@ -566,8 +574,13 @@ impl PreviewCache {
         let sample_rate = audio.sample_rate.max(1) as f32;
         let frames = audio.frame_count();
 
-        if selections.iter().any(Selection::is_polygon)
-            || self.selections.iter().any(Selection::is_polygon)
+        if selections
+            .iter()
+            .any(Selection::requires_spectral_processing)
+            || self
+                .selections
+                .iter()
+                .any(Selection::requires_spectral_processing)
         {
             return (0, frames);
         }
@@ -662,7 +675,7 @@ fn diff_selections(old: &[Selection], new: &[Selection]) -> SelectionDiff {
                     || (o.freq_high - s.freq_high).abs() > 1.0e-3;
                 let time_changed = (o.time_start - s.time_start).abs() > 1.0e-4
                     || (o.time_end - s.time_end).abs() > 1.0e-4;
-                let gain_changed = (o.gain - s.gain).abs() > 1.0e-4;
+                let gain_changed = (o.gain_db - s.gain_db).abs() > 1.0e-4;
                 let action_changed = o.action != s.action;
                 let full_band_changed = o.full_band != s.full_band;
                 let shape_changed = o.shape != s.shape;
@@ -712,7 +725,7 @@ mod tests {
     fn full_band_zero_gain_preview_is_silent_in_window() {
         let audio = tone(48_000, 440.0, 48_000);
         let mut sel = Selection::new(1, 0.25, 0.5, 0.0, 24_000.0, SelectionAction::Gain, true);
-        sel.gain = 0.0;
+        sel.gain_db = -60.0;
         let preview = render_full(&audio, std::slice::from_ref(&sel));
         assert!(preview[12_000..24_000].iter().all(|v| v.abs() < 1.0e-6));
         assert!(preview[1_000..11_000].iter().any(|v| v.abs() > 1.0e-3));
@@ -726,7 +739,7 @@ mod tests {
             vec![(0.2, 300.0), (0.8, 900.0), (0.9, 1_200.0), (0.3, 700.0)],
             SelectionAction::Gain,
         );
-        polygon.gain = 0.0;
+        polygon.gain_db = -60.0;
         let exact = apply_spectral_masks(&audio, std::slice::from_ref(&polygon), 2048, 512);
         assert_eq!(render_full(&audio, std::slice::from_ref(&polygon)), exact);
 
@@ -738,7 +751,7 @@ mod tests {
     fn incremental_render_matches_fresh_full_render() {
         let audio = tone(96_000, 440.0, 48_000);
         let mut sel_a = Selection::new(1, 0.5, 1.0, 0.0, 24_000.0, SelectionAction::Gain, true);
-        sel_a.gain = 0.0;
+        sel_a.gain_db = -60.0;
 
         let mut cache = PreviewCache::new();
         let out_a = cache.render(&audio, std::slice::from_ref(&sel_a));
@@ -789,7 +802,7 @@ mod tests {
         let audio = tone(96_000, 440.0, 48_000);
         let mut selection =
             Selection::new(8, 0.5, 0.75, 0.0, 24_000.0, SelectionAction::Gain, true);
-        selection.gain = 0.0;
+        selection.gain_db = -60.0;
         let mut cache = PreviewCache::new();
         cache.render(&audio, std::slice::from_ref(&selection));
 
@@ -803,7 +816,7 @@ mod tests {
     fn full_band_toggle_updates_incremental_preview_to_match_fresh_render() {
         let audio = tone(96_000, 440.0, 48_000);
         let mut selection = Selection::new(9, 0.4, 0.8, 300.0, 900.0, SelectionAction::Gain, false);
-        selection.gain = 0.0;
+        selection.gain_db = -60.0;
         let mut cache = PreviewCache::new();
         cache.render(&audio, std::slice::from_ref(&selection));
 
@@ -835,7 +848,7 @@ mod tests {
         };
         let mut selection =
             Selection::new(11, 0.2, 1.8, 500.0, 1_000.0, SelectionAction::Gain, false);
-        selection.gain = 0.0;
+        selection.gain_db = -60.0;
         let mut cache = PreviewCache::new();
         cache.render(&audio, std::slice::from_ref(&selection));
 
@@ -868,7 +881,7 @@ mod tests {
         // Set gain to zero for 700-1400 Hz only between 0.5 and 1.5 s; outside that window the
         // 9 kHz tone AND the 1 kHz tone must both survive at full level.
         let mut sel = Selection::new(1, 0.5, 1.5, 700.0, 1400.0, SelectionAction::Gain, false);
-        sel.gain = 0.0;
+        sel.gain_db = -60.0;
         let out = render_full(&audio, std::slice::from_ref(&sel));
 
         let before = 4800..19_200; // 0.1-0.4 s, outside the window
@@ -908,7 +921,7 @@ mod tests {
             duration: 2.0,
         };
         let mut sel = Selection::new(1, 0.25, 0.75, 700.0, 1400.0, SelectionAction::Gain, false);
-        sel.gain = 0.0;
+        sel.gain_db = -60.0;
         let mut cache = PreviewCache::new();
         cache.render(&audio, std::slice::from_ref(&sel));
         assert_eq!(cache.band_signals.len(), 1);
@@ -930,7 +943,7 @@ mod tests {
         let audio1 = tone(48_000, 440.0, 48_000);
         let audio2 = tone(48_000, 880.0, 48_000);
         let mut sel = Selection::new(1, 0.25, 0.5, 0.0, 24_000.0, SelectionAction::Gain, true);
-        sel.gain = 0.0;
+        sel.gain_db = -60.0;
         let mut cache = PreviewCache::new();
         cache.render(&audio1, std::slice::from_ref(&sel));
         let out = cache.render(&audio2, std::slice::from_ref(&sel));
@@ -957,7 +970,7 @@ mod tests {
             duration: 1.0,
         };
         let mut sel = Selection::new(1, 0.25, 0.75, 700.0, 1400.0, SelectionAction::Gain, false);
-        sel.gain = 0.0;
+        sel.gain_db = -60.0;
         let out = render_full(&audio, std::slice::from_ref(&sel));
         // Right channel must stay silent everywhere.
         assert!(out.chunks_exact(2).all(|frame| frame[1].abs() < 1.0e-5));

@@ -12,7 +12,7 @@ use crate::audio::export::export_wav;
 use crate::audio::preview::{PreviewCache, PreviewOutcome};
 use crate::audio::process::apply_selections;
 use crate::audio::spectrogram::{self, SpectrogramPatch};
-use crate::audio::types::{AudioData, Selection, SelectionAction, Spectrogram};
+use crate::audio::types::{AudioData, Selection, SelectionAction, SelectionTool, Spectrogram};
 use crate::playback::PlaybackHandle;
 use crate::ui::spectrogram_view::SpectrogramView;
 
@@ -191,9 +191,12 @@ pub struct SpectrimApp {
     selected_selection: Option<u64>,
     next_selection_id: u64,
     default_action: SelectionAction,
-    polygon_tool: bool,
+    selection_tool: SelectionTool,
+    snap_sensitivity_db: f32,
+    snap_max_valleys: usize,
     spectrogram_view: SpectrogramView,
     pointer_coordinates: Option<(f32, f32)>,
+    pointer_intensity_db: Option<f32>,
     visible_time_range: (f32, f32),
     export_dialog_open: bool,
     export_crop_silence: bool,
@@ -237,9 +240,12 @@ impl Default for SpectrimApp {
             selected_selection: None,
             next_selection_id: 1,
             default_action: SelectionAction::Gain,
-            polygon_tool: false,
+            selection_tool: SelectionTool::Rect,
+            snap_sensitivity_db: 15.0,
+            snap_max_valleys: 1,
             spectrogram_view: SpectrogramView::default(),
             pointer_coordinates: None,
+            pointer_intensity_db: None,
             visible_time_range: (0.0, 0.0),
             export_dialog_open: false,
             export_crop_silence: false,
@@ -684,6 +690,7 @@ impl SpectrimApp {
                                     spectrogram::compute_db_range(&loaded.spectrogram.matrix);
                                 loaded.spectrogram.db_min = db_min;
                                 loaded.spectrogram.db_max = db_max;
+                                spectrogram::rebuild_peak_map(&mut loaded.spectrogram, -40.0);
                                 let image =
                                     crate::ui::spectrogram_view::color_image(&loaded.spectrogram);
                                 loaded.texture.set(image, egui::TextureOptions::LINEAR);
@@ -1016,6 +1023,14 @@ impl eframe::App for SpectrimApp {
         self.poll_workers(ctx);
         self.flush_preview_debounce(ctx);
 
+        if ctx.input(|input| input.key_pressed(egui::Key::Num1)) {
+            self.selection_tool = SelectionTool::Rect;
+        } else if ctx.input(|input| input.key_pressed(egui::Key::Num2)) {
+            self.selection_tool = SelectionTool::Polygon;
+        } else if ctx.input(|input| input.key_pressed(egui::Key::Num3)) {
+            self.selection_tool = SelectionTool::Snap;
+        }
+
         let processing = self.export_in_flight
             || self.load_receiver.is_some()
             || self.preview_dirty
@@ -1072,13 +1087,17 @@ impl eframe::App for SpectrimApp {
                 ui.selectable_value(&mut self.default_action, SelectionAction::Gain, "Gain");
                 ui.selectable_value(&mut self.default_action, SelectionAction::Solo, "Solo")
                     .on_hover_text("Solo regions are combined as a union; while any Solo exists, Gain regions are ignored.");
-                if ui
-                    .selectable_label(self.polygon_tool, "Polygon tool")
-                    .on_hover_text("Click to add vertices. Close by clicking the first point, double-clicking, or pressing Enter. Esc cancels. Drag vertices later to edit.")
-                    .clicked()
-                {
-                    self.polygon_tool = !self.polygon_tool;
-                    self.spectrogram_view.set_polygon_tool(self.polygon_tool);
+                ui.separator();
+                ui.selectable_value(&mut self.selection_tool, SelectionTool::Rect, "Rectangle");
+                ui.selectable_value(&mut self.selection_tool, SelectionTool::Polygon, "Polygon")
+                    .on_hover_text("Click vertices; close at first point, double-click or Enter. Esc cancels; drag vertices to edit.");
+                ui.selectable_value(&mut self.selection_tool, SelectionTool::Snap, "Snap")
+                    .on_hover_text("Hover to preview the peak region; click to select. No peak means no selection.");
+                if self.selection_tool == SelectionTool::Snap {
+                    ui.add(egui::Slider::new(&mut self.snap_sensitivity_db, 0.0..=45.0)
+                        .text("Sensitivity"));
+                    ui.add(egui::Slider::new(&mut self.snap_max_valleys, 1..=8)
+                        .text("Valleys"));
                 }
                 if ui
                     .add_enabled(
@@ -1131,6 +1150,7 @@ impl eframe::App for SpectrimApp {
             });
 
         let mut selections_modified = false;
+        let mut seek_after_view = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(loaded) = &self.loaded {
                 ui.horizontal(|ui| {
@@ -1147,8 +1167,15 @@ impl eframe::App for SpectrimApp {
                     ));
                     if let Some((time, frequency)) = self.pointer_coordinates {
                         ui.label(format!("· {time:.3}s · {frequency:.1} Hz"));
+                        if let Some(intensity) = self.pointer_intensity_db {
+                            if intensity.is_finite() {
+                                ui.label(format!("· {intensity:.1} dB"));
+                            } else {
+                                ui.label("· −∞ dB");
+                            }
+                        }
                     } else {
-                        ui.label("· —");
+                        ui.label("· — · — dB");
                     }
                 });
                 let events = self.spectrogram_view.show(
@@ -1159,7 +1186,10 @@ impl eframe::App for SpectrimApp {
                     &mut self.selections,
                     self.selected_selection,
                     current_time,
-                    self.polygon_tool,
+                    self.selection_tool == SelectionTool::Polygon,
+                    self.selection_tool == SelectionTool::Snap,
+                    self.snap_sensitivity_db,
+                    self.snap_max_valleys,
                 );
                 let visible_frequency_span = events.visible_ranges.3 - events.visible_ranges.2;
                 self.visible_time_range = (events.visible_ranges.0, events.visible_ranges.1);
@@ -1184,6 +1214,7 @@ impl eframe::App for SpectrimApp {
                     selections_modified = true;
                 }
                 self.pointer_coordinates = events.pointer_coordinates;
+                self.pointer_intensity_db = events.pointer_intensity_db;
                 if events.drag_started {
                     self.plot_drag_active = true;
                     if self.is_playing {
@@ -1197,7 +1228,7 @@ impl eframe::App for SpectrimApp {
                     }
                 }
                 if let Some(time) = events.seek_to {
-                    self.seek(time);
+                    seek_after_view = Some(time);
                 }
                 if let Some((time_start, time_end, freq_low, freq_high, full_band)) = events.created
                 {
@@ -1224,6 +1255,20 @@ impl eframe::App for SpectrimApp {
                     self.next_selection_id += 1;
                     selections_modified = true;
                 }
+                if let Some((first_frame, ranges)) = events.created_mask.clone() {
+                    self.selections.push(Selection::mask(
+                        self.next_selection_id,
+                        first_frame,
+                        ranges,
+                        loaded.spectrogram.hop_length,
+                        loaded.spectrogram.sample_rate,
+                        loaded.spectrogram.n_fft,
+                        self.default_action,
+                    ));
+                    self.selected_selection = Some(self.next_selection_id);
+                    self.next_selection_id += 1;
+                    selections_modified = true;
+                }
                 if let Some(id) = events.deleted {
                     self.selections.retain(|selection| selection.id != id);
                     if self.selected_selection == Some(id) {
@@ -1239,6 +1284,9 @@ impl eframe::App for SpectrimApp {
         });
         if selections_modified {
             self.selections_changed();
+        }
+        if let Some(time) = seek_after_view {
+            self.seek(time);
         }
 
         if self.export_dialog_open {

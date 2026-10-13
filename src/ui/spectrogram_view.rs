@@ -3,7 +3,9 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::audio::spectrogram::SpectrogramPatch;
-use crate::audio::types::{AudioData, Selection, SelectionAction, SelectionShape, Spectrogram};
+use crate::audio::types::{
+    AudioData, Selection, SelectionAction, SelectionShape, SelectionTool, Spectrogram,
+};
 
 /// Half-width of the playhead notch triangle. Doubles as its grab radius, so
 /// the visual affordance and the hit area always agree.
@@ -22,6 +24,15 @@ pub struct SpectrogramView {
     detail: Option<DetailTexture>,
     polygon_tool: bool,
     polygon_points: Vec<(f32, f32)>,
+    snap_preview: Option<SnapPreview>,
+}
+
+#[derive(Clone)]
+struct SnapPreview {
+    seed_frame: usize,
+    seed_bin: usize,
+    first_frame: usize,
+    ranges: Vec<(usize, usize)>,
 }
 
 struct DetailTexture {
@@ -72,6 +83,8 @@ pub struct ViewEvents {
     pub visible_ranges: (f32, f32, f32, f32),
     pub view_changed: bool,
     pub created_polygon: Option<Vec<(f32, f32)>>,
+    pub created_mask: Option<(usize, Vec<(usize, usize)>)>,
+    pub pointer_intensity_db: Option<f32>,
 }
 
 impl SpectrogramView {
@@ -95,6 +108,13 @@ impl SpectrogramView {
         }
     }
 
+    pub fn set_tool(&mut self, tool: SelectionTool) {
+        self.set_polygon_tool(tool == SelectionTool::Polygon);
+        if tool != SelectionTool::Snap {
+            self.snap_preview = None;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
@@ -106,6 +126,9 @@ impl SpectrogramView {
         selected_id: Option<u64>,
         playhead: f32,
         polygon_tool: bool,
+        snap_tool: bool,
+        snap_sensitivity_db: f32,
+        snap_max_valleys: usize,
     ) -> ViewEvents {
         let outer = ui.available_rect_before_wrap();
         let plot = egui::Rect::from_min_max(
@@ -121,7 +144,13 @@ impl SpectrogramView {
 
         let duration = audio.duration.max(0.001);
         let nyquist = (audio.sample_rate as f32 * 0.5).max(1.0);
-        self.set_polygon_tool(polygon_tool);
+        self.set_tool(if polygon_tool {
+            SelectionTool::Polygon
+        } else if snap_tool {
+            SelectionTool::Snap
+        } else {
+            SelectionTool::Rect
+        });
         let (time_start, time_end) = self.time_range.unwrap_or((0.0, duration));
         let (freq_low, freq_high) = self.frequency_range.unwrap_or((0.0, nyquist));
         let time_span = (time_end - time_start).max(0.001);
@@ -253,6 +282,45 @@ impl SpectrogramView {
                             *point,
                             7.0,
                             egui::Stroke::new(1.0, egui::Color32::WHITE),
+                        );
+                    }
+                }
+                continue;
+            }
+            if let SelectionShape::Mask {
+                first_frame,
+                ranges,
+                sample_rate,
+                hop_length,
+                n_fft,
+            } = &selection.shape
+            {
+                let color = match selection.action {
+                    SelectionAction::Solo => egui::Color32::from_rgb(40, 190, 185),
+                    SelectionAction::Gain => egui::Color32::from_rgb(250, 170, 50),
+                }
+                .gamma_multiply(selection_alpha);
+                for (offset, (low, high)) in ranges.iter().enumerate() {
+                    let time = (*first_frame + offset) as f32 * *hop_length as f32
+                        / (*sample_rate).max(1) as f32;
+                    let row_time = *hop_length as f32 / (*sample_rate).max(1) as f32;
+                    let top =
+                        hz_to_y((*high + 1) as f32 * *sample_rate as f32 / (*n_fft).max(1) as f32);
+                    let bottom =
+                        hz_to_y(*low as f32 * *sample_rate as f32 / (*n_fft).max(1) as f32);
+                    let row = egui::Rect::from_two_pos(
+                        egui::pos2(time_to_x(time), top),
+                        egui::pos2(time_to_x(time + row_time), bottom),
+                    )
+                    .intersect(plot);
+                    if row.is_positive() {
+                        ui.painter()
+                            .rect_filled(row, 0.0, color.gamma_multiply(0.22));
+                        ui.painter().rect_stroke(
+                            row,
+                            0.0,
+                            egui::Stroke::new(0.7, color),
+                            egui::StrokeKind::Inside,
                         );
                     }
                 }
@@ -402,6 +470,8 @@ impl SpectrogramView {
             visible_ranges: (time_start, time_end, freq_low, freq_high),
             view_changed: false,
             created_polygon: None,
+            created_mask: None,
+            pointer_intensity_db: None,
         };
 
         let hover_pointer = ui
@@ -536,10 +606,57 @@ impl SpectrogramView {
             }
         }
 
+        if snap_tool {
+            self.snap_preview = hover_pointer.and_then(|position| {
+                let (time, hz) = point_to_values(position);
+                let (first_frame, ranges) = crate::audio::spectrogram::grow_peak_mask(
+                    spectrogram,
+                    time,
+                    hz,
+                    snap_sensitivity_db,
+                    snap_max_valleys,
+                )?;
+                let seed_frame = ((time * spectrogram.sample_rate as f32)
+                    / spectrogram.hop_length.max(1) as f32)
+                    .round() as usize;
+                let seed_bin = spectrogram.hz_to_bin(hz);
+                Some(SnapPreview {
+                    seed_frame,
+                    seed_bin,
+                    first_frame,
+                    ranges,
+                })
+            });
+            if let Some(preview) = &self.snap_preview {
+                draw_mask_overlay(
+                    ui.painter(),
+                    preview,
+                    spectrogram,
+                    &time_to_x,
+                    &hz_to_y,
+                    plot,
+                );
+            } else if hover_pointer.is_some() {
+                ui.ctx()
+                    .output_mut(|output| output.cursor_icon = egui::CursorIcon::NotAllowed);
+            }
+            if response.clicked_by(egui::PointerButton::Primary) {
+                if let Some(preview) = self.snap_preview.take() {
+                    events.created_mask = Some((preview.first_frame, preview.ranges));
+                }
+            }
+        }
+
         // --- Standard Interaction / Pan -------------------------------------
         if let Some(position) = hover_pointer {
             let (time, hz) = point_to_values(position);
             events.pointer_coordinates = Some((time, hz));
+            let frame = ((time * spectrogram.sample_rate as f32)
+                / spectrogram.hop_length.max(1) as f32)
+                .round() as usize;
+            let bin = spectrogram.hz_to_bin(hz);
+            events.pointer_intensity_db =
+                Some(spectrogram.at(bin, frame.min(spectrogram.n_time.saturating_sub(1))));
             // Advertise that the playhead can be grabbed, and do so on the
             // unclamped position so the plot edges stay free for creating
             // regions.
@@ -631,7 +748,10 @@ impl SpectrogramView {
             }
         }
 
-        if !self.polygon_tool && response.drag_started_by(egui::PointerButton::Primary) {
+        if !self.polygon_tool
+            && !snap_tool
+            && response.drag_started_by(egui::PointerButton::Primary)
+        {
             if let Some(position) = pointer {
                 events.drag_started = true;
                 if !self.polygon_tool {
@@ -644,7 +764,7 @@ impl SpectrogramView {
                             })
                             .find(|(_, point)| point.distance(position) <= 9.0)
                             .map(|(index, _)| (selection.id, index)),
-                        SelectionShape::Rect => None,
+                        SelectionShape::Rect | SelectionShape::Mask { .. } => None,
                     };
                     let vertex = selected_id
                         .and_then(|id| selections.iter().find(|selection| selection.id == id))
@@ -669,6 +789,12 @@ impl SpectrogramView {
                 {
                     if let SelectionShape::Polygon { points } = &selected.shape {
                         if point_in_polygon(point_to_values(position), points) {
+                            events.selected = Some(Some(selected.id));
+                        } else {
+                            self.drag = Some(DragMode::Create(position));
+                        }
+                    } else if selected.is_mask() {
+                        if point_in_selection(point_to_values(position), selected) {
                             events.selected = Some(Some(selected.id));
                         } else {
                             self.drag = Some(DragMode::Create(position));
@@ -770,7 +896,7 @@ impl SpectrogramView {
             }
         }
 
-        if !self.polygon_tool && response.dragged_by(egui::PointerButton::Primary) {
+        if !self.polygon_tool && !snap_tool && response.dragged_by(egui::PointerButton::Primary) {
             if let Some(position) = pointer {
                 match self.drag {
                     Some(DragMode::PolygonVertex { id, index }) => {
@@ -864,7 +990,7 @@ impl SpectrogramView {
             }
         }
 
-        if !self.polygon_tool && response.drag_stopped() {
+        if !self.polygon_tool && !snap_tool && response.drag_stopped() {
             events.drag_stopped = true;
             if let (Some(DragMode::Create(start)), Some(end)) = (self.drag, pointer) {
                 if (start.x - end.x).abs() > 4.0 && (start.y - end.y).abs() > 4.0 {
@@ -887,7 +1013,7 @@ impl SpectrogramView {
         }
 
         if response.secondary_clicked() {
-            if !self.polygon_tool {
+            if !self.polygon_tool && !snap_tool {
                 events.deleted = pointer.and_then(|position| {
                     selections
                         .iter()
@@ -1018,6 +1144,27 @@ fn point_in_selection(point: (f32, f32), selection: &Selection) -> bool {
                 && point.1 <= selection.freq_high
         }
         SelectionShape::Polygon { points } => point_in_polygon(point, points),
+        SelectionShape::Mask {
+            first_frame,
+            ranges,
+            sample_rate,
+            hop_length,
+            n_fft,
+        } => {
+            if *sample_rate == 0 || *hop_length == 0 || *n_fft == 0 {
+                return false;
+            }
+            let frame = (point.0 * *sample_rate as f32 / *hop_length as f32).round() as isize
+                - *first_frame as isize;
+            let Some((low, high)) = usize::try_from(frame)
+                .ok()
+                .and_then(|index| ranges.get(index))
+            else {
+                return false;
+            };
+            let bin = (point.1 * *n_fft as f32 / *sample_rate as f32).round() as usize;
+            (*low..=*high).contains(&bin)
+        }
     }
 }
 
@@ -1044,6 +1191,43 @@ fn draw_dashed_line(
         );
         offset += dash + gap;
     }
+}
+
+fn draw_mask_overlay(
+    painter: &egui::Painter,
+    preview: &SnapPreview,
+    spectrogram: &Spectrogram,
+    time_to_x: &impl Fn(f32) -> f32,
+    hz_to_y: &impl Fn(f32) -> f32,
+    plot: egui::Rect,
+) {
+    let fill = egui::Color32::from_rgba_unmultiplied(255, 180, 35, 92);
+    for (offset, &(low, high)) in preview.ranges.iter().enumerate() {
+        let frame = preview.first_frame + offset;
+        let t0 = spectrogram.frame_to_time(frame);
+        let t1 = spectrogram.frame_to_time(frame.saturating_add(1));
+        let f0 = spectrogram.bin_to_hz(low);
+        let f1 = spectrogram.bin_to_hz(high.saturating_add(1).min(spectrogram.n_freq - 1));
+        let rect = egui::Rect::from_two_pos(
+            egui::pos2(time_to_x(t0), hz_to_y(f1)),
+            egui::pos2(time_to_x(t1), hz_to_y(f0)),
+        )
+        .intersect(plot);
+        if rect.is_positive() {
+            painter.rect_filled(rect, 0.0, fill);
+        }
+    }
+    let seed_time = spectrogram.frame_to_time(preview.seed_frame);
+    let seed_hz = spectrogram.bin_to_hz(preview.seed_bin);
+    let seed = egui::pos2(time_to_x(seed_time), hz_to_y(seed_hz));
+    painter.line_segment(
+        [seed + egui::vec2(-5.0, 0.0), seed + egui::vec2(5.0, 0.0)],
+        egui::Stroke::new(1.5, egui::Color32::WHITE),
+    );
+    painter.line_segment(
+        [seed + egui::vec2(0.0, -5.0), seed + egui::vec2(0.0, 5.0)],
+        egui::Stroke::new(1.5, egui::Color32::WHITE),
+    );
 }
 
 fn draw_polygon_fill(painter: &egui::Painter, points: &[egui::Pos2], color: egui::Color32) {

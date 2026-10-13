@@ -46,6 +46,8 @@ pub struct Spectrogram {
     pub sample_rate: u32,
     pub db_min: f32,
     pub db_max: f32,
+    /// Per-time-frame local maxima above the analysis floor, in frequency bins.
+    pub peaks: Vec<Vec<usize>>,
 }
 
 impl Spectrogram {
@@ -88,7 +90,25 @@ pub enum SelectionAction {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SelectionShape {
     Rect,
-    Polygon { points: Vec<(f32, f32)> },
+    Polygon {
+        points: Vec<(f32, f32)>,
+    },
+    /// Per-STFT-frame frequency-bin intervals. Frame/bin coordinates refer to
+    /// the analysis spectrogram used when this mask was created.
+    Mask {
+        first_frame: usize,
+        ranges: Vec<(usize, usize)>,
+        sample_rate: u32,
+        hop_length: usize,
+        n_fft: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionTool {
+    Rect,
+    Polygon,
+    Snap,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -100,15 +120,31 @@ pub struct Selection {
     pub freq_high: f32,
     pub action: SelectionAction,
     pub enabled: bool,
-    /// Linear gain multiplier used by `Gain` and `Solo` selections.
-    pub gain: f32,
+    /// Gain in dB; -60 dB is the practical silence floor and 0 dB is unity.
+    pub gain_db: f32,
     pub full_band: bool,
     pub shape: SelectionShape,
 }
 
 impl Selection {
+    pub fn gain_linear(&self) -> f32 {
+        if !self.gain_db.is_finite() || self.gain_db <= -60.0 {
+            0.0
+        } else {
+            10.0_f32.powf(self.gain_db.min(12.0) / 20.0)
+        }
+    }
+
     pub fn is_polygon(&self) -> bool {
         matches!(self.shape, SelectionShape::Polygon { .. })
+    }
+
+    pub fn is_mask(&self) -> bool {
+        matches!(self.shape, SelectionShape::Mask { .. })
+    }
+
+    pub fn requires_spectral_processing(&self) -> bool {
+        !matches!(self.shape, SelectionShape::Rect)
     }
 
     pub fn refresh_bounds(&mut self) {
@@ -152,7 +188,7 @@ impl Selection {
             freq_high: freq_a.max(freq_b),
             action,
             enabled: true,
-            gain: 0.5,
+            gain_db: 0.0,
             full_band,
             shape: SelectionShape::Rect,
         }
@@ -183,9 +219,47 @@ impl Selection {
             freq_high,
             action,
             enabled: true,
-            gain: 0.5,
+            gain_db: 0.0,
             full_band: false,
             shape: SelectionShape::Polygon { points },
+        }
+    }
+
+    pub fn mask(
+        id: u64,
+        first_frame: usize,
+        ranges: Vec<(usize, usize)>,
+        hop: usize,
+        sample_rate: u32,
+        n_fft: usize,
+        action: SelectionAction,
+    ) -> Self {
+        let time_start = first_frame as f32 * hop as f32 / sample_rate.max(1) as f32;
+        let time_end = (first_frame + ranges.len().saturating_sub(1)) as f32 * hop as f32
+            / sample_rate.max(1) as f32;
+        let freq_low = ranges.iter().map(|range| range.0).min().unwrap_or(0) as f32
+            * sample_rate as f32
+            / n_fft.max(1) as f32;
+        let freq_high = ranges.iter().map(|range| range.1).max().unwrap_or(0) as f32
+            * sample_rate as f32
+            / n_fft.max(1) as f32;
+        Self {
+            id,
+            time_start,
+            time_end,
+            freq_low,
+            freq_high,
+            action,
+            enabled: true,
+            gain_db: 0.0,
+            full_band: false,
+            shape: SelectionShape::Mask {
+                first_frame,
+                ranges,
+                sample_rate,
+                hop_length: hop,
+                n_fft,
+            },
         }
     }
 }
@@ -197,4 +271,21 @@ pub(crate) fn hann_window(length: usize) -> Vec<f32> {
     (0..length)
         .map(|index| 0.5 - 0.5 * (2.0 * PI * index as f32 / (length - 1) as f32).cos())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gain_db_converts_to_linear_amplitude_and_infinity_mutes() {
+        let mut selection = Selection::new(1, 0.0, 1.0, 0.0, 1_000.0, SelectionAction::Gain, true);
+        assert!((selection.gain_linear() - 1.0).abs() < 1e-6);
+        selection.gain_db = -6.0206;
+        assert!((selection.gain_linear() - 0.5).abs() < 1e-4);
+        selection.gain_db = 6.0;
+        assert!((selection.gain_linear() - 1.9952623).abs() < 1e-5);
+        selection.gain_db = f32::NEG_INFINITY;
+        assert_eq!(selection.gain_linear(), 0.0);
+    }
 }

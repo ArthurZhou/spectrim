@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use crate::audio::types::{Selection, SelectionAction, SelectionShape};
+use crate::audio::types::{Selection, SelectionAction};
 
 #[derive(Default)]
 pub struct RegionEvents {
@@ -38,6 +38,8 @@ pub fn show(
                 let previous = selection.action;
                 if selection.is_polygon() {
                     ui.label("Polygon");
+                } else if selection.is_mask() {
+                    ui.label("Snapped mask");
                 } else {
                     ui.label("Rectangle");
                 }
@@ -57,9 +59,9 @@ pub fn show(
                     remove.push(selection.id);
                 }
             });
-            if selection.is_polygon() {
+            if selection.is_polygon() || selection.is_mask() {
                 ui.label(format!(
-                    "Time: {:.3}–{:.3}s · edit vertices on plot",
+                    "Time: {:.3}–{:.3}s · geometry is tied to FFT bins",
                     selection.time_start, selection.time_end
                 ));
             } else {
@@ -85,13 +87,30 @@ pub fn show(
             if selection.action == SelectionAction::Gain {
                 ui.horizontal(|ui| {
                     ui.label("Gain");
-                    events.changed |= ui
-                        .add(egui::Slider::new(&mut selection.gain, 0.0..=4.0).suffix("×"))
-                        .changed();
+                    if selection.gain_db.is_finite() {
+                        events.changed |= ui
+                            .add(
+                                egui::Slider::new(&mut selection.gain_db, -60.0..=12.0)
+                                    .suffix(" dB"),
+                            )
+                            .changed();
+                        if ui.small_button("Mute").clicked() {
+                            selection.gain_db = f32::NEG_INFINITY;
+                            events.changed = true;
+                        }
+                    } else {
+                        ui.label("−∞ dB");
+                        if ui.small_button("Unmute").clicked() {
+                            selection.gain_db = 0.0;
+                            events.changed = true;
+                        }
+                    }
                 });
             }
-            if matches!(selection.shape, SelectionShape::Polygon { .. }) {
+            if selection.is_polygon() {
                 ui.label("Vertices: polygon region");
+            } else if selection.is_mask() {
+                ui.label("Per-frame snapped frequency ranges");
             } else if selection.full_band {
                 ui.label(format!("Frequency: 0 – {nyquist:.0} Hz (full band)"));
             } else {
@@ -114,7 +133,7 @@ pub fn show(
                         .changed();
                 });
             }
-            if !selection.is_polygon() {
+            if !selection.requires_spectral_processing() {
                 let was_full_band = selection.full_band;
                 let full_band_changed =
                     ui.checkbox(&mut selection.full_band, "Full band").changed();
